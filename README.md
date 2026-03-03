@@ -1,6 +1,5 @@
 # CDF: Consolidation Detection Framework
 
-**Author:** James Sawyer  
 **Project type:** Research software and reference implementation  
 **Primary audience:** Quantitative researchers, systematic traders, market structure analysts, and technical reviewers who want an interpretable consolidation detector rather than an opaque prediction stack
 
@@ -8,7 +7,7 @@
 
 CDF studies market consolidation as a measurable structural regime in OHLC time series. The framework does not treat consolidation as a loose chart annotation. It treats it as a composite state defined by compression, bounded price exploration, non-persistent local dynamics, contextual similarity to prior episodes, and directional candle diagnostics. The implementation then estimates whether that state resolves into a directional breakout, calibrates the resulting probabilities, and exports an inspection-oriented dashboard.
 
-This repository was created by **James Sawyer** to answer a practical research question: can consolidation be detected and ranked with transparent statistics before any breakout model is applied? The design goal is not to hide signal generation inside a black-box architecture. The design goal is to separate structural regime detection from directional expansion scoring so that a reviewer can inspect each stage, challenge each assumption, and reproduce the full pipeline.
+This repository was created to answer a practical research question: can consolidation be detected and ranked with transparent statistics before any breakout model is applied? The design goal is not to hide signal generation inside a black-box architecture. The design goal is to separate structural regime detection from directional expansion scoring so that a reviewer can inspect each stage, challenge each assumption, and reproduce the full pipeline.
 
 The resulting system is intentionally technical. It combines volatility contraction, price-position stability, Hurst-style persistence diagnostics [1], RSI and momentum-style trend context derived from Wilder-era technical analysis [6], attention-like historical context matching, periodic time encoding, a local autoregressive anchor inspired by the long-short temporal decomposition used in LSTNet [5], Bayesian hyperparameter search with TPE through Optuna [2][3], rolling-origin cross-validation for time-order preservation [4], and a monotonic post-hoc probability calibration stage. The emphasis is on interpretable research machinery, not minimal code golf.
 
@@ -21,7 +20,7 @@ Many breakout systems fail because they conflate two different problems:
 1. Is the market actually in a compressed regime?
 2. If it is, is the subsequent move strong enough to treat as expansion rather than noise?
 
-CDF separates those questions. James Sawyer built this repository for users who care about that separation:
+CDF separates those questions for users who care about that separation:
 
 - researchers testing whether consolidation is a statistically coherent state rather than a discretionary label
 - systematic traders who want to audit component scores instead of trusting a single indicator
@@ -63,6 +62,24 @@ The implementation in [`cdf.py`](cdf.py) follows a single end-to-end pipeline:
 7. Export metrics and an interactive dashboard.
 
 This repository is currently a **single-file reference implementation** rather than a packaged library. That choice keeps the research logic in one place for audit and review.
+
+## Included Example
+
+The repository already includes a compact local test path:
+
+- [`backtest_prices.csv`](backtest_prices.csv): bundled OHLC sample input for a smoke test
+- [`results/consolidation_dashboard_latest.html`](results/consolidation_dashboard_latest.html): generated example dashboard artifact
+
+GitHub will display the HTML source rather than the interactive dashboard surface. To inspect the dashboard properly, open the file locally in a browser after cloning the repository.
+
+For a fast local test:
+
+```bash
+python3 cdf.py
+open results/consolidation_dashboard_latest.html
+```
+
+On non-macOS systems, replace `open` with your platform's browser launch command or open the HTML file manually.
 
 ## Data Contract
 
@@ -308,6 +325,7 @@ python3 cdf.py
 
 Notes:
 
+- The repository already includes `backtest_prices.csv` and a generated example dashboard in `results/`.
 - Plotly is required for dashboard generation.
 - If `REJECT_STALE_BACKTEST_DATA` is set to `False`, CDF can load the local CSV directly.
 - If stale-data rejection is enabled, the optional companion module `backtest_loader.py` must be available.

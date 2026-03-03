@@ -7,7 +7,7 @@
 
 ## Abstract
 
-This note describes the design of the Consolidation Detection Framework (CDF), a research-oriented system for identifying consolidation regimes in OHLC time series and estimating directional breakout probability after structural compression. The framework was built by James Sawyer for quantitative researchers and systematic traders who want an interpretable market-structure model rather than an opaque end-to-end predictor. CDF treats consolidation as a composite statistical state defined by volatility contraction, bounded price exploration, non-persistent local dynamics, historical-context similarity, temporal phase structure, and directional candle diagnostics. It then applies time-series-aware hyperparameter selection, monotonic probability calibration, and dashboard reporting to produce an auditable research workflow.
+This note describes the design of the Consolidation Detection Framework (CDF), a research-oriented system for identifying consolidation regimes in OHLC time series and estimating directional breakout probability after structural compression. The framework is aimed at quantitative researchers and systematic traders who want an interpretable market-structure model rather than an opaque end-to-end predictor. CDF treats consolidation as a composite statistical state defined by volatility contraction, bounded price exploration, non-persistent local dynamics, historical-context similarity, temporal phase structure, and directional candle diagnostics. It then applies time-series-aware hyperparameter selection, monotonic probability calibration, and dashboard reporting to produce an auditable research workflow.
 
 ## 1. Motivation
 
@@ -236,7 +236,7 @@ CDF reports more than final directional calls. It also exposes:
 - rolling instability in core engineered features
 - optimization parameter influence estimates
 
-This is essential to the purpose of the repository. James Sawyer built CDF to be inspectable. The dashboard is not an afterthought. It is part of the evidence trail.
+This is essential to the purpose of the repository. The dashboard is not an afterthought. It is part of the evidence trail.
 
 ## 11. Implementation Mapping
 
@@ -283,7 +283,7 @@ The framework is therefore best understood as an interpretable research instrume
 
 ## 14. Conclusion
 
-The central claim of CDF is that consolidation can be treated as a structured, inspectable, multi-component regime rather than as a vague visual pattern. James Sawyer created the framework for technically demanding users who want that claim expressed in code, diagnostics, and validation logic rather than in rhetoric. The contribution of the repository is not that it predicts everything. The contribution is that it makes regime detection explicit, testable, and reviewable.
+The central claim of CDF is that consolidation can be treated as a structured, inspectable, multi-component regime rather than as a vague visual pattern. The contribution of the repository is not that it predicts everything. The contribution is that it makes regime detection explicit, testable, and reviewable.
 
 ## References
 
