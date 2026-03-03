@@ -1,12 +1,15 @@
 """Consolidation Detection Framework.
 
-Research-oriented pipeline for detecting consolidation regimes in OHLC time
-series, optimizing detector parameters with rolling-origin validation, and
-exporting diagnostic dashboards for review.
+CDF is a research-oriented Python framework by James Sawyer for detecting
+consolidation regimes in OHLC time series, optimizing detector parameters with
+rolling-origin validation, and exporting diagnostic dashboards for review.
 
 The module keeps the full workflow in one reference implementation: data
 loading, feature engineering, parameter search, consolidation scoring,
-breakout estimation, and visualization.
+breakout estimation, probability calibration, and visualization.
+
+Project notes and related research:
+https://labs.jamessawyer.co.uk/
 """
 
 import hashlib
