@@ -1,0 +1,21 @@
+cff-version: 1.2.0
+message: "If you use CDF in research, internal reports, or derivative work, please cite it using this metadata."
+title: "CDF: Consolidation Detection Framework"
+type: software
+authors:
+  - family-names: "Sawyer"
+    given-names: "James"
+license: "MIT"
+repository-code: "https://github.com/tg12/cdf"
+url: "https://github.com/tg12/cdf"
+abstract: >-
+  Research-oriented framework for detecting consolidation regimes in OHLC time
+  series, optimizing structural and breakout parameters with rolling-origin
+  validation, calibrating directional breakout probabilities, and exporting
+  audit-friendly diagnostics and dashboards.
+keywords:
+  - "consolidation detection"
+  - "market structure"
+  - "time series"
+  - "breakout modeling"
+  - "quantitative research"
