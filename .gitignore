@@ -208,7 +208,4 @@ __marimo__/
 
 # CDF local artifacts
 .DS_Store
-backtest_prices.csv
-results/*.csv
-results/*.html
 results/*.json

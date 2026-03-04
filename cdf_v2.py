@@ -1,17 +1,3 @@
-"""Consolidation Detection Framework.
-
-CDF is a research-oriented Python framework by James Sawyer for detecting
-consolidation regimes in OHLC time series, optimizing detector parameters with
-rolling-origin validation, and exporting diagnostic dashboards for review.
-
-The module keeps the full workflow in one reference implementation: data
-loading, feature engineering, parameter search, consolidation scoring,
-breakout estimation, probability calibration, and visualization.
-
-Project notes and related research:
-https://labs.jamessawyer.co.uk/
-"""
-
 import hashlib
 import html
 import inspect
@@ -27,14 +13,14 @@ from typing import Any
 import numpy as np
 import optuna
 import pandas as pd
+from backtest_loader import load_backtest_prices
 from optuna.pruners import MedianPruner
 from optuna.samplers import TPESampler
-from sklearn.metrics import f1_score, precision_score, recall_score
-
-try:
-    from backtest_loader import load_backtest_prices
-except ImportError:
-    load_backtest_prices = None
+from sklearn.impute import SimpleImputer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import brier_score_loss, f1_score
+from sklearn.pipeline import Pipeline
+from sklearn.preprocessing import StandardScaler
 
 # =============================================================================
 # CONFIGURATION - ALL VARIABLES AT TOP OF FILE
@@ -56,13 +42,34 @@ OPTIMIZATION_TRIALS = 100
 VALIDATION_SPLITS = 5
 RANDOM_SEED = 42
 OPTIMIZATION_DIRECTION = "maximize"
-STABILITY_PENALTY_WEIGHT = 0.15
 MIN_VALIDATION_FOLDS = 2
 ROLLING_CV_TRAIN_WINDOW_MULTIPLIER = 3
 PROBABILITY_CALIBRATION_ENABLED = True
 PROBABILITY_CALIBRATION_BINS = 7
 PROBABILITY_CALIBRATION_MIN_SAMPLES = 25
 PROBABILITY_CALIBRATION_BLEND = 0.65
+
+# Baseline benchmark configuration
+BASELINE_BENCHMARK_ENABLED = True
+BASELINE_FEATURE_COLUMNS = (
+    "hl_range_pct",
+    "vol_ratio_20",
+    "trend_strength_20",
+    "price_position_20",
+    "body_to_range_ratio",
+    "wick_balance",
+    "hurst_20",
+    "rsi_20",
+)
+BASELINE_LOGISTIC_C = 1.0
+BASELINE_LOGISTIC_MAX_ITER = 1000
+
+# Real-time forecasting configuration
+REALTIME_DIRECTION_THRESHOLD = 0.55
+REALTIME_SIMILAR_LOOKBACK = 25
+REALTIME_BOOTSTRAP_SAMPLES = 250
+REALTIME_CI_LOW = 5.0
+REALTIME_CI_HIGH = 95.0
 
 # Feature calculation periods
 SHORT_PERIODS = [5, 10]
@@ -311,6 +318,48 @@ def _build_rolling_origin_splits(
         )
 
     return splits
+
+
+def _build_future_direction_targets(df: pd.DataFrame, horizon: int) -> pd.Series:
+    """Return future breakout direction labels for the given lookahead horizon."""
+    future_returns = df[CLOSE_COLUMN].pct_change(horizon).shift(-horizon)
+    return pd.Series(np.sign(future_returns), index=df.index, dtype=np.float64)
+
+
+def _predict_validation_fold_with_history(
+    df: pd.DataFrame,
+    train_idx: np.ndarray,
+    val_idx: np.ndarray,
+    params: "OptimizationParams",
+) -> tuple[pd.Series, pd.Series]:
+    """Predict a validation fold while preserving the preceding train history."""
+    fold_start = int(train_idx[0])
+    fold_end = int(val_idx[-1]) + 1
+    fold_df = df.iloc[fold_start:fold_end].copy()
+    evaluation_index = df.index[val_idx]
+
+    detector = ConsolidationDetector(params)
+    predictor = BreakoutPredictor(params)
+    fold_cons = detector.detect(fold_df)
+    fold_probs, fold_dirs = predictor.predict(fold_df, fold_cons)
+
+    val_probs = fold_probs.reindex(evaluation_index).fillna(0.0)
+    val_dirs = fold_dirs.reindex(evaluation_index).fillna(0).astype(int)
+    return val_probs, val_dirs
+
+
+def _map_directional_probabilities_to_up_probability(
+    probabilities: pd.Series,
+    directions: pd.Series,
+) -> pd.Series:
+    """Convert directional breakout probabilities into a binary up-probability."""
+    up_probability = pd.Series(0.5, index=probabilities.index, dtype=np.float64)
+    clipped = probabilities.astype(np.float64).clip(0.0, 1.0)
+    up_mask = directions > 0
+    down_mask = directions < 0
+    up_probability.loc[up_mask] = clipped.loc[up_mask]
+    up_probability.loc[down_mask] = 1.0 - clipped.loc[down_mask]
+    return up_probability.clip(0.0, 1.0)
 
 
 # =============================================================================
@@ -884,7 +933,7 @@ class ConsolidationDetector:
         start_idx: int,
         lookback: int,
     ) -> float:
-        """Approximate temporal attention using feature-space similarity."""
+        """Approximate context matching using similarity over engineered features."""
         return self._similarity_weighted_history_score(
             df=df,
             reference_idx=reference_idx,
@@ -978,7 +1027,7 @@ class ConsolidationDetector:
         score = 0.4 * mean_conviction + 0.3 * consistency + 0.3 * trend_score
         return np.float64(min(max(score, 0.0), 1.0))
 
-    def assess_sutte_directional_alignment(
+    def detect_sutte_stacking_divergence(
         self,
         df: pd.DataFrame,
         consolidation_score: float,
@@ -1016,7 +1065,7 @@ class ConsolidationDetector:
         recent_return = (end_close - start_close) / (start_close + PRICE_EPSILON)
         price_trend = np.float64(np.sign(recent_return))
         sutte_trend = np.float64(np.sign(recent_sutte))
-        structure_score = min(max(np.float64(consolidation_score), 0.0), 1.0)
+        stacking_score = min(max(np.float64(consolidation_score), 0.0), 1.0)
 
         if (
             abs(recent_sutte) <= SUTTE_DIVERGENCE_SIGNAL_THRESHOLD
@@ -1031,14 +1080,14 @@ class ConsolidationDetector:
                 "price_trend": price_trend,
             }
 
-        confidence_multiplier = 1.0 + 0.5 * structure_score
+        confidence_multiplier = 1.0 + 0.5 * stacking_score
         if sutte_trend != price_trend:
             divergence = np.float64(-price_trend)
-            signal = "DIVERGENT"
+            signal = "FADE"
             confidence = min(abs(recent_sutte) * confidence_multiplier * 2.0, 1.0)
         else:
             divergence = price_trend
-            signal = "ALIGNED"
+            signal = "TRUST"
             confidence = min(abs(recent_sutte) * confidence_multiplier * 1.5, 1.0)
 
         return {
@@ -1196,7 +1245,141 @@ class ConsolidationDetector:
             + self.params.weight_scale * scale_anchor_score_norm
             + self.params.weight_sutte * sutte_score_norm
         )
-        sutte_divergence = self.assess_sutte_directional_alignment(
+        sutte_divergence = self.detect_sutte_stacking_divergence(
+            past_window,
+            consolidation_score,
+        )
+
+        return ConsolidationFeatures(
+            start_idx=start_idx,
+            end_idx=end_idx,
+            duration=lookback,
+            range_width=past_range,
+            range_width_pct=past_range_pct,
+            volatility_ratio=vol_contraction,
+            mean_reversion_strength=position_component,
+            hurst_exponent=hurst_value,
+            consolidation_score=consolidation_score,
+            attention_context_score_raw=attention_context_score,
+            periodic_context_score_raw=periodic_context_score,
+            scale_anchor_score_raw=scale_anchor_score,
+            attention_context_score=attention_context_score_norm,
+            periodic_context_score=periodic_context_score_norm,
+            scale_anchor_score=scale_anchor_score_norm,
+            sutte_score_raw=sutte_score_raw,
+            sutte_score=sutte_score_norm,
+            sutte_divergence=np.float64(sutte_divergence["divergence"]),
+            sutte_divergence_confidence=np.float64(sutte_divergence["confidence"]),
+            sutte_divergence_signal=str(sutte_divergence["signal"]),
+            interaction_score=interaction_score,
+            timestamp_start=df.index[start_idx] if hasattr(df.index, "__getitem__") else None,
+            timestamp_end=df.index[end_idx] if hasattr(df.index, "__getitem__") else None,
+        )
+
+    def score_live_window(
+        self,
+        df: pd.DataFrame,
+        idx: int | None = None,
+    ) -> ConsolidationFeatures | None:
+        """
+        Score the latest available window without requiring future bars.
+
+        This is the inference-only path used for real-time forecasting. It reuses
+        the consolidation scoring logic but skips the backtest-only lookforward gate.
+        """
+        if df.empty:
+            return None
+
+        live_idx = len(df) - 1 if idx is None else int(idx)
+        if live_idx <= 0 or live_idx >= len(df):
+            return None
+
+        lookback = min(self.params.lookback_period, live_idx)
+        if lookback < self.params.min_bars:
+            return None
+
+        start_idx = live_idx - lookback
+        end_idx = live_idx - 1
+        past_window = df.iloc[start_idx:live_idx]
+        if past_window.empty:
+            return None
+
+        close_mean = np.float64(past_window["close"].mean())
+        if not np.isfinite(close_mean) or close_mean <= 0.0:
+            return None
+
+        past_range = np.float64(past_window["high"].max() - past_window["low"].min())
+        past_range_pct = past_range / (close_mean + PRICE_EPSILON) * 100.0
+
+        past_vol = np.float64(past_window["hl_range_pct"].mean())
+        historical_vol = df["hl_range_pct"].iloc[max(0, start_idx - lookback * 3) : live_idx].mean()
+        vol_contraction = past_vol / historical_vol if historical_vol > 0 else 1.0
+
+        price_positions = self._calculate_price_positions(df, start_idx, end_idx)
+        pos_std = np.float64(np.std(price_positions)) if price_positions else 1.0
+
+        hurst_value = HURST_DEFAULT
+        if "hurst_20" in df.columns:
+            hurst_value = np.float64(df["hurst_20"].iloc[end_idx])
+
+        interaction_score = self._calculate_interaction_score(past_window)
+        position_component = (
+            0.5 * (1.0 - min(pos_std * self.params.position_sensitivity, 1.0))
+            + 0.5 * interaction_score
+        )
+        attention_context_score = self._calculate_attention_context_score(
+            df=df,
+            reference_idx=end_idx,
+            start_idx=start_idx,
+            lookback=lookback,
+        )
+        attention_context_score_norm = self._normalize_component_score(
+            attention_context_score,
+            ATTENTION_SCORE_TYPICAL_MIN,
+            ATTENTION_SCORE_TYPICAL_MAX,
+        )
+        periodic_context_score = self._calculate_periodic_context_score(
+            df=df,
+            reference_idx=end_idx,
+            start_idx=start_idx,
+            lookback=lookback,
+        )
+        periodic_context_score_norm = self._normalize_component_score(
+            periodic_context_score,
+            PERIODIC_SCORE_TYPICAL_MIN,
+            PERIODIC_SCORE_TYPICAL_MAX,
+        )
+        scale_anchor_score = self._calculate_scale_anchor_score(past_window["close"])
+        scale_anchor_score_norm = self._normalize_component_score(
+            scale_anchor_score,
+            SCALE_SCORE_TYPICAL_MIN,
+            SCALE_SCORE_TYPICAL_MAX,
+        )
+        sutte_score_raw = self._calculate_sutte_score(past_window)
+        sutte_score_norm = self._normalize_component_score(
+            sutte_score_raw,
+            SUTTE_SCORE_TYPICAL_MIN,
+            SUTTE_SCORE_TYPICAL_MAX,
+        )
+
+        consolidation_score = (
+            self.params.weight_contraction * (1.0 - min(vol_contraction, 1.0))
+            + self.params.weight_range
+            * (
+                1.0
+                - min(
+                    past_range_pct / ((past_vol + PRICE_EPSILON) * self.params.range_threshold),
+                    1.0,
+                )
+            )
+            + self.params.weight_position * position_component
+            + self.params.weight_hurst * self._hurst_non_persistence_score(hurst_value)
+            + self.params.weight_attention * attention_context_score_norm
+            + self.params.weight_periodic * periodic_context_score_norm
+            + self.params.weight_scale * scale_anchor_score_norm
+            + self.params.weight_sutte * sutte_score_norm
+        )
+        sutte_divergence = self.detect_sutte_stacking_divergence(
             past_window,
             consolidation_score,
         )
@@ -1380,6 +1563,79 @@ class BreakoutPredictor:
 
         return breakout_probs, breakout_dirs
 
+    def predict_current_breakout(
+        self,
+        df: pd.DataFrame,
+        cons: ConsolidationFeatures,
+        idx: int | None = None,
+    ) -> tuple[float, int]:
+        """Score breakout probability for a single live bar without future lookahead."""
+        if df.empty:
+            return 0.0, 0
+
+        live_idx = len(df) - 1 if idx is None else int(idx)
+        if live_idx <= cons.end_idx or live_idx >= len(df):
+            return 0.0, 0
+
+        zone_window = df.iloc[cons.start_idx : cons.end_idx + 1]
+        zone_high = np.float64(zone_window["high"].max())
+        zone_low = np.float64(zone_window["low"].min())
+        zone_range = zone_high - zone_low
+        if not np.isfinite(zone_range) or zone_range <= 0.0:
+            return 0.0, 0
+
+        current_price = np.float64(df["close"].iloc[live_idx])
+        cons_vol = np.float64(df["hl_range_pct"].iloc[cons.start_idx : cons.end_idx + 1].mean())
+        if not np.isfinite(cons_vol) or cons_vol <= 0.0:
+            cons_vol = PRICE_EPSILON
+
+        current_vol = np.float64(df["hl_range_pct"].iloc[max(0, live_idx - 10) : live_idx].mean())
+        if not np.isfinite(current_vol) or current_vol <= 0.0:
+            current_vol = cons_vol
+
+        vol_ratio = current_vol / (cons_vol + PRICE_EPSILON)
+        context_bias = 1.0 + BREAKOUT_CONTEXT_BONUS * np.mean(
+            [
+                cons.consolidation_score,
+                cons.attention_context_score,
+                cons.periodic_context_score,
+                cons.scale_anchor_score,
+            ]
+        )
+
+        direction = 0
+        breakout_strength = 0.0
+        if current_price > zone_high:
+            dist_to_high = (current_price - zone_high) / zone_range
+            breakout_strength = (1.0 + dist_to_high) * max(vol_ratio, 0.0) * context_bias
+            direction = 1
+        elif current_price < zone_low:
+            dist_to_low = (zone_low - current_price) / zone_range
+            breakout_strength = (1.0 + dist_to_low) * max(vol_ratio, 0.0) * context_bias
+            direction = -1
+        else:
+            return 0.0, 0
+
+        if breakout_strength < self.params.min_expansion:
+            return 0.0, 0
+
+        prob = 1 / (
+            1
+            + np.exp(
+                -self.params.logistic_steepness
+                * (breakout_strength - self.params.min_expansion - self.params.logistic_threshold)
+            )
+        )
+        prob = np.clip(
+            prob
+            * self._sutte_confidence(df, live_idx, direction)
+            * self._sutte_structure_confidence(cons, direction),
+            0.0,
+            1.0,
+        )
+        confirmed_direction = direction if prob > 0.5 else 0
+        return np.float64(prob), confirmed_direction
+
     def _sutte_confidence(self, df: pd.DataFrame, idx: int, direction: int) -> float:
         """Adjust breakout confidence using the current Sutte signal alignment."""
         if (
@@ -1408,7 +1664,7 @@ class BreakoutPredictor:
         cons: ConsolidationFeatures,
         direction: int,
     ) -> float:
-        """Adjust breakout confidence using Sutte-price directional alignment."""
+        """Adjust breakout confidence using the consolidation window's trust-or-fade bias."""
         if cons.sutte_divergence_signal == "NEUTRAL" or cons.sutte_divergence_confidence <= 0.0:
             return 1.0
 
@@ -1569,8 +1825,20 @@ class ParameterOptimizer:
         )
 
         self.best_params = self._dict_to_params(self.study.best_params)
-
-        self.logger.info(f"Optimization complete. Best score: {self.study.best_value:.4f}")
+        best_mean_brier = -np.float64(self.study.best_value)
+        self.logger.info(
+            "Optimization complete. Best mean validation Brier: %.4f",
+            best_mean_brier,
+        )
+        if self.study.best_trial is not None:
+            self.logger.info(
+                "Best fold coverage: %.1f%%, answered accuracy: %.1f%%",
+                100.0 * np.float64(self.study.best_trial.user_attrs.get("fold_mean_coverage", 0.0)),
+                100.0
+                * np.float64(
+                    self.study.best_trial.user_attrs.get("fold_mean_answered_accuracy", 0.0)
+                ),
+            )
         return self.best_params
 
     def _predict_validation_fold(
@@ -1581,19 +1849,7 @@ class ParameterOptimizer:
         params: OptimizationParams,
     ) -> tuple[pd.Series, pd.Series]:
         """Predict the validation window while keeping the preceding train history visible."""
-        fold_start = int(train_idx[0])
-        fold_end = int(val_idx[-1]) + 1
-        fold_df = df.iloc[fold_start:fold_end].copy()
-        evaluation_index = df.index[val_idx]
-
-        detector = ConsolidationDetector(params)
-        predictor = BreakoutPredictor(params)
-        fold_cons = detector.detect(fold_df)
-        fold_probs, fold_dirs = predictor.predict(fold_df, fold_cons)
-
-        val_probs = fold_probs.reindex(evaluation_index).fillna(0.0)
-        val_dirs = fold_dirs.reindex(evaluation_index).fillna(0).astype(int)
-        return val_probs, val_dirs
+        return _predict_validation_fold_with_history(df, train_idx, val_idx, params)
 
     def _objective(
         self,
@@ -1601,28 +1857,43 @@ class ParameterOptimizer:
         df: pd.DataFrame,
         cv_splits: list[tuple[np.ndarray, np.ndarray]],
     ) -> float:
-        """Objective function for Optuna optimization."""
+        """Optimize the detector on out-of-fold probability quality."""
         params = self._suggest_params(trial)
-
-        scores: list[float] = []
+        fold_metrics: list[dict[str, float]] = []
 
         for train_idx, val_idx in cv_splits:
             val_data = df.iloc[val_idx].copy()
-            _, val_dirs = self._predict_validation_fold(df, train_idx, val_idx, params)
-            score = self._calculate_validation_score(val_data, val_dirs, params.max_hold)
-            if score > -1:
-                scores.append(score)
+            val_probs, val_dirs = self._predict_validation_fold(df, train_idx, val_idx, params)
+            metrics = self._calculate_validation_metrics(
+                val_data,
+                val_probs,
+                val_dirs,
+                params.max_hold,
+            )
+            if metrics is not None:
+                fold_metrics.append(metrics)
 
-        if len(scores) < MIN_VALIDATION_FOLDS:
+        if len(fold_metrics) < MIN_VALIDATION_FOLDS:
             return -1.0
 
-        mean_score = np.float64(np.mean(scores))
-        stability_penalty = self._calculate_stability_penalty(scores)
-        adjusted_score = mean_score - (STABILITY_PENALTY_WEIGHT * stability_penalty)
+        mean_brier = np.float64(np.mean([metrics["brier"] for metrics in fold_metrics]))
+        mean_coverage = np.float64(np.mean([metrics["coverage"] for metrics in fold_metrics]))
+        mean_answered_accuracy = np.float64(
+            np.mean([metrics["answered_accuracy"] for metrics in fold_metrics])
+        )
+        mean_f1 = np.float64(np.mean([metrics["active_f1"] for metrics in fold_metrics]))
+        mean_sharpe = np.float64(np.mean([metrics["active_sharpe"] for metrics in fold_metrics]))
+        brier_std = np.float64(np.std([metrics["brier"] for metrics in fold_metrics]))
 
-        trial.set_user_attr("fold_mean_score", mean_score)
-        trial.set_user_attr("fold_stability_penalty", stability_penalty)
-        return adjusted_score
+        trial.set_user_attr("fold_mean_brier", mean_brier)
+        trial.set_user_attr("fold_brier_std", brier_std)
+        trial.set_user_attr("fold_mean_coverage", mean_coverage)
+        trial.set_user_attr("fold_mean_answered_accuracy", mean_answered_accuracy)
+        trial.set_user_attr("fold_mean_active_f1", mean_f1)
+        trial.set_user_attr("fold_mean_active_sharpe", mean_sharpe)
+        if mean_coverage <= PRICE_EPSILON:
+            return -1.0
+        return np.float64(-mean_brier)
 
     def _suggest_params(self, trial: optuna.Trial) -> OptimizationParams:
         """Suggest parameters for optimization trial."""
@@ -1685,91 +1956,73 @@ class ParameterOptimizer:
             weight_sutte=norm_sutte,
         )
 
-    def _calculate_validation_score(
-        self, df: pd.DataFrame, directions: pd.Series, max_hold: int
-    ) -> float:
-        """Calculate validation score for predictions."""
-        if len(directions[directions != 0]) == 0:
-            return -1.0
-
-        future_returns = df["close"].pct_change(max_hold).shift(-max_hold)
-        actual_dirs = np.sign(future_returns)
-
-        common_idx = directions.index.intersection(actual_dirs.index)
+    def _calculate_validation_metrics(
+        self,
+        df: pd.DataFrame,
+        probabilities: pd.Series,
+        directions: pd.Series,
+        max_hold: int,
+    ) -> dict[str, float] | None:
+        """Return interpretable out-of-fold diagnostics for one validation split."""
+        actual_dirs = _build_future_direction_targets(df, max_hold)
+        common_idx = probabilities.index.intersection(directions.index).intersection(
+            actual_dirs.index
+        )
         if len(common_idx) == 0:
-            return -1.0
+            return None
 
-        aligned_pred = directions[common_idx]
-        aligned_actual = actual_dirs[common_idx]
+        aligned_probs = probabilities.loc[common_idx].astype(np.float64)
+        aligned_pred = directions.loc[common_idx].astype(int)
+        aligned_actual = actual_dirs.loc[common_idx]
 
-        non_zero_mask = aligned_actual != 0
-        if not non_zero_mask.any():
-            return -1.0
+        valid_mask = aligned_actual.isin([-1.0, 1.0])
+        if not valid_mask.any():
+            return None
 
-        aligned_pred = aligned_pred[non_zero_mask]
-        aligned_actual = aligned_actual[non_zero_mask]
+        aligned_probs = aligned_probs.loc[valid_mask]
+        aligned_pred = aligned_pred.loc[valid_mask]
+        aligned_actual = aligned_actual.loc[valid_mask].astype(int)
+        up_probability = _map_directional_probabilities_to_up_probability(
+            aligned_probs,
+            aligned_pred,
+        )
+        actual_up = (aligned_actual == 1).astype(int)
+        brier = np.float64(brier_score_loss(actual_up, up_probability))
+        coverage = np.float64((aligned_pred != 0).mean())
 
-        try:
-            precision = precision_score(
-                aligned_actual,
-                aligned_pred,
+        active_mask = aligned_pred != 0
+        if not active_mask.any():
+            return {
+                "brier": brier,
+                "coverage": coverage,
+                "answered_accuracy": 0.0,
+                "active_f1": 0.0,
+                "active_sharpe": 0.0,
+            }
+
+        active_pred = aligned_pred.loc[active_mask]
+        active_actual = aligned_actual.loc[active_mask]
+        answered_accuracy = np.float64((active_pred == active_actual).mean())
+        f1 = np.float64(
+            f1_score(
+                active_actual,
+                active_pred,
                 average="weighted",
                 zero_division=0,
             )
-            recall = recall_score(
-                aligned_actual,
-                aligned_pred,
-                average="weighted",
-                zero_division=0,
-            )
-            f1 = f1_score(
-                aligned_actual,
-                aligned_pred,
-                average="weighted",
-                zero_division=0,
-            )
-
-            strategy_returns = aligned_pred * future_returns.loc[aligned_pred.index]
-            sharpe = (
-                strategy_returns.mean() / (strategy_returns.std() + PRICE_EPSILON) * np.sqrt(252)
-            )
-
-            score = 0.3 * f1 + 0.3 * sharpe + 0.4 * (precision + recall) / 2
-            return np.float64(score)
-        except ValueError as exc:
-            self.logger.debug("Score calculation error: %s", exc)
-            return -1.0
-
-    def _calculate_stability_penalty(self, fold_scores: list[float]) -> float:
-        """Penalize downside fragility across validation folds."""
-        if len(fold_scores) < 2:
-            return 0.0
-
-        arr = np.asarray(fold_scores, dtype=np.float64)
-        mean_score = np.float64(np.mean(arr))
-        mean_abs = np.float64(np.mean(np.abs(arr)))
-        scale = max(mean_abs, abs(mean_score), 1.0)
-
-        shortfalls = np.maximum(mean_score - arr, 0.0)
-        downside_deviation = np.float64(np.sqrt(np.mean(np.square(shortfalls))))
-        lower_quartile_gap = max(mean_score - np.float64(np.percentile(arr, 25.0)), 0.0)
-        worst_fold_gap = max(mean_score - np.float64(np.min(arr)), 0.0)
-        degradation_trend = 0.0
-        if len(arr) >= 3:
-            fold_positions = np.arange(len(arr), dtype=np.float64)
-            try:
-                slope, _ = np.polyfit(fold_positions, arr, 1)
-            except (np.linalg.LinAlgError, ValueError, FloatingPointError):
-                slope = 0.0
-            degradation_trend = max(0.0, -np.float64(slope))
-
-        penalty = (
-            0.35 * downside_deviation
-            + 0.25 * lower_quartile_gap
-            + 0.20 * worst_fold_gap
-            + 0.20 * degradation_trend
-        ) / (scale + PRICE_EPSILON)
-        return np.float64(penalty)
+        )
+        future_returns = df[CLOSE_COLUMN].pct_change(max_hold).shift(-max_hold).loc[common_idx]
+        strategy_returns = active_pred * future_returns.loc[active_pred.index]
+        sharpe = np.float64(
+            strategy_returns.mean() / (strategy_returns.std() + PRICE_EPSILON) * np.sqrt(252)
+        )
+        return {
+            "brier": brier,
+            "coverage": coverage,
+            "answered_accuracy": answered_accuracy,
+            "active_f1": f1,
+            "active_sharpe": sharpe,
+        }
 
     def _dict_to_params(self, params_dict: dict[str, Any]) -> OptimizationParams:
         """Convert dictionary to OptimizationParams."""
@@ -1878,19 +2131,7 @@ class ProbabilityCalibrator:
         val_idx: np.ndarray,
     ) -> tuple[pd.Series, pd.Series]:
         """Predict validation probabilities with the train window available as history."""
-        fold_start = int(train_idx[0])
-        fold_end = int(val_idx[-1]) + 1
-        fold_df = df.iloc[fold_start:fold_end].copy()
-        evaluation_index = df.index[val_idx]
-
-        detector = ConsolidationDetector(self.params)
-        predictor = BreakoutPredictor(self.params)
-        fold_cons = detector.detect(fold_df)
-        fold_probs, fold_dirs = predictor.predict(fold_df, fold_cons)
-
-        val_probs = fold_probs.reindex(evaluation_index).fillna(0.0)
-        val_dirs = fold_dirs.reindex(evaluation_index).fillna(0).astype(int)
-        return val_probs, val_dirs
+        return _predict_validation_fold_with_history(df, train_idx, val_idx, self.params)
 
     def fit(self, df: pd.DataFrame) -> ProbabilityCalibrationModel | None:
         """
@@ -2051,6 +2292,326 @@ class ProbabilityCalibrator:
 
 
 # =============================================================================
+# BASELINE BENCHMARK
+# =============================================================================
+
+
+@dataclass
+class BenchmarkResult:
+    """Aggregate out-of-fold benchmark metrics for a directional model."""
+
+    sample_count: int
+    coverage: float
+    answered_accuracy: float
+    brier_score: float
+
+
+@dataclass
+class RealTimeForecast:
+    """Container for the latest-bar consolidation forecast."""
+
+    timestamp: datetime | None
+    is_consolidating: bool
+    consolidation_score: float
+    breakout_probability: float
+    breakout_direction: int
+    confidence_interval: tuple[float, float]
+    regime_warning: bool
+    bars_since_last_consolidation: int
+    current_zone: tuple[float, float] | None
+    zone_position: float | None
+    signal_source: str
+    model_confidence: str
+    similar_historical_setups: int
+    similar_outcomes: dict[str, int]
+    horizon_bars: int
+    warnings: tuple[str, ...] = ()
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a compact JSON-serializable forecast payload."""
+        direction_label = "none"
+        if self.breakout_direction > 0:
+            direction_label = "up"
+        elif self.breakout_direction < 0:
+            direction_label = "down"
+
+        zone_value: list[float] | None = None
+        if self.current_zone is not None:
+            zone_value = [float(self.current_zone[0]), float(self.current_zone[1])]
+
+        forecast_block: dict[str, Any] | None = None
+        if self.is_consolidating:
+            forecast_block = {
+                "direction": direction_label,
+                "probability": float(self.breakout_probability),
+                "horizon_bars": int(self.horizon_bars),
+                "confidence_interval": [
+                    float(self.confidence_interval[0]),
+                    float(self.confidence_interval[1]),
+                ],
+                "source": self.signal_source,
+            }
+
+        return {
+            "now": self.timestamp.isoformat() if self.timestamp is not None else None,
+            "consolidation": {
+                "active": bool(self.is_consolidating),
+                "score": float(self.consolidation_score),
+                "zone": zone_value,
+                "bars_since_last": int(self.bars_since_last_consolidation),
+                "position_in_zone": (
+                    None if self.zone_position is None else float(self.zone_position)
+                ),
+            },
+            "forecast": forecast_block,
+            "warnings": list(self.warnings),
+            "context": {
+                "regime_shift_detected": bool(self.regime_warning),
+                "model_confidence": self.model_confidence,
+                "similar_historical_setups": int(self.similar_historical_setups),
+                "similar_outcomes": dict(self.similar_outcomes),
+            },
+        }
+
+
+class BaselineBenchmark:
+    """Compare the optimized detector against a simple logistic baseline."""
+
+    def __init__(
+        self,
+        params: OptimizationParams,
+        n_splits: int = VALIDATION_SPLITS,
+        feature_columns: tuple[str, ...] = BASELINE_FEATURE_COLUMNS,
+    ):
+        """
+        Initialize the baseline benchmark runner.
+
+        Args:
+            params: Optimized detector and predictor parameters.
+            n_splits: Number of rolling-origin splits used for benchmarking.
+            feature_columns: Feature columns exposed to the logistic baseline.
+        """
+        self.params = params
+        self.n_splits = n_splits
+        self.feature_columns = feature_columns
+        self.logger = logging.getLogger(__name__)
+
+    def evaluate(self, df: pd.DataFrame) -> dict[str, float]:
+        """Benchmark the optimized model against a regularized logistic baseline."""
+        try:
+            cv_splits = _build_rolling_origin_splits(len(df), self.n_splits)
+        except ValueError as exc:
+            self.logger.warning("Skipping baseline benchmark: %s", exc)
+            return {}
+
+        model_actual_chunks: list[pd.Series] = []
+        model_dir_chunks: list[pd.Series] = []
+        model_prob_chunks: list[pd.Series] = []
+        baseline_actual_chunks: list[pd.Series] = []
+        baseline_dir_chunks: list[pd.Series] = []
+        baseline_prob_chunks: list[pd.Series] = []
+
+        for train_idx, val_idx in cv_splits:
+            fold_result = self._evaluate_fold(df, train_idx, val_idx)
+            if fold_result is None:
+                continue
+
+            (
+                model_actual,
+                model_dirs,
+                model_up_prob,
+                baseline_actual,
+                baseline_dirs,
+                baseline_up_prob,
+            ) = fold_result
+            model_actual_chunks.append(model_actual)
+            model_dir_chunks.append(model_dirs)
+            model_prob_chunks.append(model_up_prob)
+            baseline_actual_chunks.append(baseline_actual)
+            baseline_dir_chunks.append(baseline_dirs)
+            baseline_prob_chunks.append(baseline_up_prob)
+
+        if not model_actual_chunks or not baseline_actual_chunks:
+            self.logger.warning("Skipping baseline benchmark: no labeled validation rows found.")
+            return {}
+
+        model_result = self._aggregate_result(
+            actual_dirs=pd.concat(model_actual_chunks),
+            predicted_dirs=pd.concat(model_dir_chunks),
+            up_probabilities=pd.concat(model_prob_chunks),
+        )
+        baseline_result = self._aggregate_result(
+            actual_dirs=pd.concat(baseline_actual_chunks),
+            predicted_dirs=pd.concat(baseline_dir_chunks),
+            up_probabilities=pd.concat(baseline_prob_chunks),
+        )
+
+        metrics = {
+            "benchmark_sample_count": float(model_result.sample_count),
+            "benchmark_model_coverage": model_result.coverage,
+            "benchmark_model_answered_accuracy": model_result.answered_accuracy,
+            "benchmark_model_brier": model_result.brier_score,
+            "benchmark_baseline_coverage": baseline_result.coverage,
+            "benchmark_baseline_answered_accuracy": baseline_result.answered_accuracy,
+            "benchmark_baseline_brier": baseline_result.brier_score,
+            "benchmark_accuracy_delta": (
+                model_result.answered_accuracy - baseline_result.answered_accuracy
+            ),
+            "benchmark_brier_improvement": (baseline_result.brier_score - model_result.brier_score),
+            "benchmark_model_beats_baseline": float(
+                model_result.brier_score + PRICE_EPSILON < baseline_result.brier_score
+            ),
+        }
+        self.logger.info(
+            "Benchmark summary: model brier=%.4f, logistic brier=%.4f, improvement=%.4f",
+            metrics["benchmark_model_brier"],
+            metrics["benchmark_baseline_brier"],
+            metrics["benchmark_brier_improvement"],
+        )
+        self.logger.info(
+            "Benchmark coverage: model=%.1f%%, logistic=%.1f%%",
+            100.0 * metrics["benchmark_model_coverage"],
+            100.0 * metrics["benchmark_baseline_coverage"],
+        )
+        return metrics
+
+    def _evaluate_fold(
+        self,
+        df: pd.DataFrame,
+        train_idx: np.ndarray,
+        val_idx: np.ndarray,
+    ) -> tuple[pd.Series, pd.Series, pd.Series, pd.Series, pd.Series, pd.Series] | None:
+        """Return aligned fold outputs for the optimized model and logistic baseline."""
+        train_df = df.iloc[train_idx].copy()
+        val_df = df.iloc[val_idx].copy()
+        actual_dirs = _build_future_direction_targets(val_df, self.params.max_hold)
+        valid_mask = actual_dirs.isin([-1.0, 1.0])
+        if not valid_mask.any():
+            return None
+
+        model_probs, model_dirs = _predict_validation_fold_with_history(
+            df,
+            train_idx,
+            val_idx,
+            self.params,
+        )
+        model_actual = actual_dirs.loc[valid_mask].astype(int)
+        model_dirs = model_dirs.loc[valid_mask].astype(int)
+        model_up_prob = _map_directional_probabilities_to_up_probability(
+            model_probs.loc[valid_mask],
+            model_dirs,
+        )
+
+        baseline_up_prob, baseline_dirs = self._predict_logistic_baseline(train_df, val_df)
+        baseline_actual = actual_dirs.loc[valid_mask].astype(int)
+        baseline_dirs = baseline_dirs.loc[valid_mask].astype(int)
+        baseline_up_prob = baseline_up_prob.loc[valid_mask]
+
+        return (
+            model_actual,
+            model_dirs,
+            model_up_prob,
+            baseline_actual,
+            baseline_dirs,
+            baseline_up_prob,
+        )
+
+    def _predict_logistic_baseline(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+    ) -> tuple[pd.Series, pd.Series]:
+        """Predict breakout direction from a compact regularized logistic baseline."""
+        feature_columns = [col for col in self.feature_columns if col in train_df.columns]
+        if not feature_columns:
+            neutral = pd.Series(0.5, index=val_df.index, dtype=np.float64)
+            directions = pd.Series(0, index=val_df.index, dtype=int)
+            return neutral, directions
+
+        train_targets = _build_future_direction_targets(train_df, self.params.max_hold)
+        train_mask = train_targets.isin([-1.0, 1.0])
+        if not train_mask.any():
+            neutral = pd.Series(0.5, index=val_df.index, dtype=np.float64)
+            directions = pd.Series(0, index=val_df.index, dtype=int)
+            return neutral, directions
+
+        train_x = train_df.loc[train_mask, feature_columns]
+        train_y = (train_targets.loc[train_mask] == 1.0).astype(int)
+        if train_y.nunique() < 2:
+            constant_up_probability = np.float64(train_y.iloc[0])
+            probabilities = pd.Series(constant_up_probability, index=val_df.index, dtype=np.float64)
+            directions = pd.Series(
+                np.where(probabilities >= 0.5, 1, -1),
+                index=val_df.index,
+                dtype=int,
+            )
+            return probabilities, directions
+
+        pipeline = Pipeline(
+            steps=[
+                ("imputer", SimpleImputer(strategy="median")),
+                ("scaler", StandardScaler()),
+                (
+                    "classifier",
+                    LogisticRegression(
+                        C=BASELINE_LOGISTIC_C,
+                        class_weight="balanced",
+                        max_iter=BASELINE_LOGISTIC_MAX_ITER,
+                        random_state=RANDOM_SEED,
+                    ),
+                ),
+            ]
+        )
+        pipeline.fit(train_x, train_y)
+        val_x = val_df.loc[:, feature_columns]
+        up_probability = pipeline.predict_proba(val_x)[:, 1]
+        probabilities = pd.Series(up_probability, index=val_df.index, dtype=np.float64).clip(
+            0.0, 1.0
+        )
+        directions = pd.Series(
+            np.where(probabilities >= 0.5, 1, -1),
+            index=val_df.index,
+            dtype=int,
+        )
+        return probabilities, directions
+
+    def _aggregate_result(
+        self,
+        actual_dirs: pd.Series,
+        predicted_dirs: pd.Series,
+        up_probabilities: pd.Series,
+    ) -> BenchmarkResult:
+        """Collapse aligned out-of-fold predictions into benchmark metrics."""
+        valid_mask = actual_dirs.isin([-1, 1]) & up_probabilities.notna()
+        if not valid_mask.any():
+            return BenchmarkResult(
+                sample_count=0, coverage=0.0, answered_accuracy=0.0, brier_score=1.0
+            )
+
+        actual = actual_dirs.loc[valid_mask].astype(int)
+        predicted = predicted_dirs.loc[valid_mask].astype(int)
+        probabilities = up_probabilities.loc[valid_mask].astype(np.float64).clip(0.0, 1.0)
+        coverage = np.float64((predicted != 0).mean())
+
+        answered_mask = predicted != 0
+        if answered_mask.any():
+            answered_accuracy = np.float64(
+                (predicted.loc[answered_mask] == actual.loc[answered_mask]).mean()
+            )
+        else:
+            answered_accuracy = 0.0
+
+        actual_up = (actual == 1).astype(int)
+        brier = np.float64(brier_score_loss(actual_up, probabilities))
+        return BenchmarkResult(
+            sample_count=int(valid_mask.sum()),
+            coverage=coverage,
+            answered_accuracy=answered_accuracy,
+            brier_score=brier,
+        )
+
+
+# =============================================================================
 # DATA LOADER
 # =============================================================================
 
@@ -2085,12 +2646,6 @@ class DataLoader:
             df = df.set_index(TIMESTAMP_COLUMN).sort_index()
             self.logger.info("Loaded %d rows from %s to %s", len(df), df.index[0], df.index[-1])
             return df
-
-        if load_backtest_prices is None:
-            raise RuntimeError(
-                "backtest_loader.py is unavailable while stale-data validation is enabled. "
-                "Add the companion loader module or set REJECT_STALE_BACKTEST_DATA to False."
-            )
 
         load_kwargs: dict[str, Any] = {
             "csv_path": self.file_path,
@@ -2251,6 +2806,9 @@ class PerformanceAnalyzer:
         up_signals = len(directions[directions == 1])
         down_signals = len(directions[directions == -1])
         total_signals = up_signals + down_signals
+        metrics["up_breakout_signals"] = up_signals
+        metrics["down_breakout_signals"] = down_signals
+        metrics["neutral_signal_bars"] = len(directions) - total_signals
         if total_signals > 0:
             metrics["signal_bias"] = (up_signals - down_signals) / total_signals
         else:
@@ -2614,50 +3172,137 @@ class ConsolidationDashboard:
         frame = frame.sort_values("timestamp").drop_duplicates(subset=["timestamp"], keep="last")
         return frame.set_index("timestamp")
 
-    def _latest_signal_summary(self) -> dict[str, str | float]:
-        """Return a compact description of the latest active breakout signal."""
-        signal_mask = self.directions != 0
-        if not signal_mask.any():
+    def _format_breakout_label(self, direction: int) -> str:
+        """Return a readable label for breakout direction."""
+        if direction > 0:
+            return "Up breakout"
+        if direction < 0:
+            return "Down breakout"
+        return "Standby"
+
+    def _signal_tone(self, direction: int, visibility: str) -> str:
+        """Map breakout direction and visibility to a dashboard tone."""
+        if visibility == "subthreshold":
+            return "watch"
+        if direction > 0:
+            return "support"
+        if direction < 0:
+            return "risk"
+        return "neutral"
+
+    def _extract_latest_signal_record(
+        self,
+        probabilities: pd.Series,
+        directions: pd.Series,
+        mask: pd.Series,
+    ) -> dict[str, Any]:
+        """Return the latest signal selected by a boolean mask."""
+        aligned_mask = mask.reindex(probabilities.index).fillna(False).astype(bool)
+        if not aligned_mask.any():
             return {
                 "label": "Standby",
                 "probability": 0.0,
-                "timestamp": "No active breakout signal",
-                "tone": "neutral",
+                "timestamp": "No breakout signal",
+                "timestamp_value": None,
+                "direction": 0,
             }
 
-        latest_timestamp = self.directions[signal_mask].index[-1]
-        latest_direction = int(self.directions.loc[latest_timestamp])
-        latest_probability = np.float64(self.probabilities.loc[latest_timestamp])
-        label = "Up breakout" if latest_direction > 0 else "Down breakout"
-        tone = "bullish" if latest_direction > 0 else "bearish"
+        latest_timestamp = directions[aligned_mask].index[-1]
+        latest_direction = int(directions.loc[latest_timestamp])
+        latest_probability = np.float64(probabilities.loc[latest_timestamp])
         return {
-            "label": label,
+            "label": self._format_breakout_label(latest_direction),
             "probability": latest_probability,
             "timestamp": pd.Timestamp(latest_timestamp).strftime("%Y-%m-%d %H:%M"),
-            "tone": tone,
+            "timestamp_value": pd.Timestamp(latest_timestamp),
+            "direction": latest_direction,
         }
 
-    def _top_feature_importance_rows(self, limit: int = 8) -> list[tuple[str, float, float]]:
-        """Return top-ranked parameter influence rows for display."""
-        if not self.feature_importance:
-            return []
+    def _latest_signal_summary(
+        self,
+        probability_threshold: float = DASHBOARD_SIGNAL_PROBABILITY_THRESHOLD,
+    ) -> dict[str, Any]:
+        """Return active and raw breakout direction state for dashboard rendering."""
+        threshold_value = np.float64(min(max(probability_threshold, 0.0), 1.0))
+        probabilities = self.probabilities.reindex(self.df.index).fillna(0.0).astype(np.float64)
+        directions = self.directions.reindex(self.df.index).fillna(0).astype(int)
 
-        rows: list[tuple[str, float, float]] = []
-        for key, score in sorted(
-            self.feature_importance.items(),
-            key=lambda item: item[1],
-            reverse=True,
-        )[:limit]:
-            param_value = getattr(self.params, key, 0.0)
-            rows.append((key, np.float64(score), np.float64(param_value)))
-        return rows
+        raw_mask = directions != 0
+        active_mask = raw_mask & (probabilities >= threshold_value)
+        active_up_count = int(((directions == 1) & active_mask).sum())
+        active_down_count = int(((directions == -1) & active_mask).sum())
+        raw_up_count = int((directions == 1).sum())
+        raw_down_count = int((directions == -1).sum())
+
+        active_record = self._extract_latest_signal_record(
+            probabilities=probabilities,
+            directions=directions,
+            mask=active_mask,
+        )
+        raw_record = self._extract_latest_signal_record(
+            probabilities=probabilities,
+            directions=directions,
+            mask=raw_mask,
+        )
+
+        if active_record["direction"] != 0:
+            visibility = "active"
+            label = str(active_record["label"])
+            probability = np.float64(active_record["probability"])
+            timestamp = str(active_record["timestamp"])
+            timestamp_value = active_record["timestamp_value"]
+            direction = int(active_record["direction"])
+        elif raw_record["direction"] != 0:
+            visibility = "subthreshold"
+            label = "Standby"
+            probability = 0.0
+            timestamp = "No active breakout signal"
+            timestamp_value = None
+            direction = 0
+        else:
+            visibility = "none"
+            label = "Standby"
+            probability = 0.0
+            timestamp = "No active breakout signal"
+            timestamp_value = None
+            direction = 0
+
+        return {
+            "label": label,
+            "probability": probability,
+            "timestamp": timestamp,
+            "timestamp_value": timestamp_value,
+            "direction": direction,
+            "tone": self._signal_tone(direction, visibility),
+            "visibility": visibility,
+            "threshold": threshold_value,
+            "active_up_count": active_up_count,
+            "active_down_count": active_down_count,
+            "active_signal_count": active_up_count + active_down_count,
+            "raw_up_count": raw_up_count,
+            "raw_down_count": raw_down_count,
+            "raw_signal_count": raw_up_count + raw_down_count,
+            "latest_raw_label": str(raw_record["label"]),
+            "latest_raw_probability": np.float64(raw_record["probability"]),
+            "latest_raw_timestamp": str(raw_record["timestamp"]),
+            "latest_raw_timestamp_value": raw_record["timestamp_value"],
+            "latest_raw_direction": int(raw_record["direction"]),
+        }
 
     def create_full_dashboard(
         self,
         days_back: int | None = DASHBOARD_DAYS_BACK,
         height: int = DASHBOARD_HEIGHT,
     ) -> Any:
-        """Create the main multi-panel dashboard figure."""
+        """Create the main multi-panel dashboard figure.
+
+        Panel order (top to bottom):
+          1. Price + accepted zones + breakout signals  (primary decision surface)
+          2. Directional conviction                     (the answer: which way, how strong)
+          3. Acceptance score vs threshold              (why the model fired)
+          4. Volatility and regime context              (environmental conditions)
+          5. Detector component mix                     (internals, for diagnostics)
+        """
         go, make_subplots = self._require_plotly()
         plot_df = self._slice_plot_frame(days_back)
         start_timestamp = pd.Timestamp(plot_df.index[0])
@@ -2666,29 +3311,32 @@ class ConsolidationDashboard:
         bar_width_ms = self._infer_bar_width_ms(plot_df.index)
         range_buttons = self._build_range_selector_buttons(plot_df)
 
+        # Dark, neutral template so the plot background matches the HTML card surface.
+        _TEMPLATE = "plotly_dark"
+        _PAPER_BG = "#111827"
+        _PLOT_BG = "#131c2e"
+        _GRID = "rgba(255,255,255,0.06)"
+        _TEXT = "#cbd5e1"
+        _MUTED = "#64748b"
+
         fig = make_subplots(
             rows=5,
             cols=1,
             shared_xaxes=True,
-            vertical_spacing=0.028,
-            row_heights=[0.42, 0.13, 0.13, 0.15, 0.17],
+            vertical_spacing=0.022,
+            # Conviction panel gets slightly more room than score/regime panels.
+            row_heights=[0.40, 0.15, 0.13, 0.15, 0.17],
             specs=[
                 [{"secondary_y": False}],
                 [{"secondary_y": False}],
                 [{"secondary_y": False}],
-                [{"secondary_y": False}],
                 [{"secondary_y": True}],
+                [{"secondary_y": False}],
             ],
-            subplot_titles=(
-                "Price, accepted windows, and triggered breakouts",
-                f"Acceptance score vs threshold ({self.params.consolidation_threshold:.3f})",
-                "Directional conviction by bar",
-                "Detector component mix",
-                "Volatility and regime context",
-            ),
         )
 
-        # Panel 1 shows the raw market structure with detected zones behind price.
+        # ── Panel 1: Price + accepted zones + breakout signals ─────────────────────
+        # Primary decision surface. Zones rendered behind candles; signals on top.
         fig.add_trace(
             go.Candlestick(
                 x=plot_df.index,
@@ -2697,8 +3345,10 @@ class ConsolidationDashboard:
                 low=plot_df["low"],
                 close=plot_df["close"],
                 name="Price",
-                increasing_line_color="#0f766e",
-                decreasing_line_color="#dc2626",
+                increasing_line_color="#34d399",
+                decreasing_line_color="#f87171",
+                increasing_fillcolor="#064e3b",
+                decreasing_fillcolor="#7f1d1d",
                 showlegend=False,
             ),
             row=1,
@@ -2706,7 +3356,8 @@ class ConsolidationDashboard:
         )
 
         for cons in recent_cons:
-            opacity = min(max(cons.consolidation_score, 0.05) * 0.22, 0.28)
+            # Zone opacity scales with score so high-conviction windows stand out.
+            opacity = min(max(cons.consolidation_score, 0.05) * 0.30, 0.35)
             fig.add_vrect(
                 x0=cons.timestamp_start,
                 x1=cons.timestamp_end,
@@ -2728,7 +3379,7 @@ class ConsolidationDashboard:
                     x=[cons.timestamp_start, cons.timestamp_end],
                     y=[zone_high, zone_high],
                     mode="lines",
-                    line=dict(color="#b45309", width=1.2, dash="dash"),
+                    line=dict(color="#fbbf24", width=1.4, dash="dash"),
                     name="Resistance",
                     showlegend=False,
                     hoverinfo="skip",
@@ -2741,7 +3392,7 @@ class ConsolidationDashboard:
                     x=[cons.timestamp_start, cons.timestamp_end],
                     y=[zone_low, zone_low],
                     mode="lines",
-                    line=dict(color="#0f766e", width=1.2, dash="dash"),
+                    line=dict(color="#34d399", width=1.4, dash="dash"),
                     name="Support",
                     showlegend=False,
                     hoverinfo="skip",
@@ -2755,6 +3406,7 @@ class ConsolidationDashboard:
         signal_mask = (plot_probs >= DASHBOARD_SIGNAL_PROBABILITY_THRESHOLD) & (plot_dirs != 0)
         up_signals = plot_probs[signal_mask & (plot_dirs == 1)]
         down_signals = plot_probs[signal_mask & (plot_dirs == -1)]
+        latest_signal = self._latest_signal_summary()
 
         if not up_signals.empty:
             fig.add_trace(
@@ -2765,7 +3417,7 @@ class ConsolidationDashboard:
                     marker=dict(
                         symbol="triangle-up",
                         size=9 + up_signals.to_numpy(dtype=np.float64) * 10,
-                        color="#10b981",
+                        color="#34d399",
                         line=dict(color="#064e3b", width=1),
                     ),
                     name="Up signal",
@@ -2788,7 +3440,7 @@ class ConsolidationDashboard:
                     marker=dict(
                         symbol="triangle-down",
                         size=9 + down_signals.to_numpy(dtype=np.float64) * 10,
-                        color="#ef4444",
+                        color="#f87171",
                         line=dict(color="#7f1d1d", width=1),
                     ),
                     name="Down signal",
@@ -2802,89 +3454,123 @@ class ConsolidationDashboard:
                 col=1,
             )
 
-        # Panel 2 isolates the score trajectory at each detected consolidation endpoint.
+        if latest_signal["visibility"] == "active" and latest_signal["timestamp_value"] is not None:
+            latest_timestamp = pd.Timestamp(latest_signal["timestamp_value"])
+            if latest_timestamp in plot_df.index:
+                latest_direction = int(latest_signal["direction"])
+                latest_color = "#34d399" if latest_direction > 0 else "#f87171"
+                latest_label = str(latest_signal["label"]).lower()
+                latest_probability = np.float64(latest_signal["probability"])
+                latest_row = plot_df.loc[plot_df.index == latest_timestamp].iloc[-1]
+                latest_y = (
+                    np.float64(latest_row["high"]) * 1.006
+                    if latest_direction > 0
+                    else np.float64(latest_row["low"]) * 0.994
+                )
+                fig.add_vline(
+                    x=latest_timestamp,
+                    line_dash="dot",
+                    line_color=latest_color,
+                    line_width=1.4,
+                    opacity=0.85,
+                    row=1,
+                    col=1,
+                )
+                fig.add_annotation(
+                    x=latest_timestamp,
+                    y=latest_y,
+                    text=f"Latest {latest_label} {latest_probability:.0%}",
+                    showarrow=True,
+                    arrowcolor=latest_color,
+                    arrowhead=2,
+                    ax=30,
+                    ay=-40 if latest_direction > 0 else 40,
+                    bgcolor="rgba(17, 24, 39, 0.92)",
+                    bordercolor=latest_color,
+                    borderpad=6,
+                    font=dict(color=latest_color, size=11),
+                    row=1,
+                    col=1,
+                )
+
+        # ── Panel 2: Directional conviction ─────────────────────────────────────────
+        # Most actionable read. Up bars above zero, down bars below. Threshold lines
+        # show where the model considers a signal confirmed.
+        up_bar_kwargs: dict[str, Any] = {
+            "x": plot_probs[plot_dirs == 1].index,
+            "y": plot_probs[plot_dirs == 1],
+            "name": "Up conviction",
+            "marker_color": "#34d399",
+            "opacity": 0.82,
+        }
+        if bar_width_ms is not None:
+            up_bar_kwargs["width"] = bar_width_ms
+        if len(up_bar_kwargs["x"]) > 0:
+            fig.add_trace(go.Bar(**up_bar_kwargs), row=2, col=1)
+
+        down_bar_kwargs: dict[str, Any] = {
+            "x": plot_probs[plot_dirs == -1].index,
+            "y": -plot_probs[plot_dirs == -1],
+            "name": "Down conviction",
+            "marker_color": "#f87171",
+            "opacity": 0.82,
+        }
+        if bar_width_ms is not None:
+            down_bar_kwargs["width"] = bar_width_ms
+        if len(down_bar_kwargs["x"]) > 0:
+            fig.add_trace(go.Bar(**down_bar_kwargs), row=2, col=1)
+
+        fig.add_hline(y=0.0, line_color="rgba(255,255,255,0.20)", line_width=1, row=2, col=1)
+        fig.add_hline(
+            y=DASHBOARD_SIGNAL_PROBABILITY_THRESHOLD,
+            line_dash="dot",
+            line_color="rgba(251,191,36,0.55)",
+            annotation_text=f"threshold {DASHBOARD_SIGNAL_PROBABILITY_THRESHOLD:.0%}",
+            annotation_font_color="#fbbf24",
+            annotation_font_size=10,
+            row=2,
+            col=1,
+        )
+        fig.add_hline(
+            y=-DASHBOARD_SIGNAL_PROBABILITY_THRESHOLD,
+            line_dash="dot",
+            line_color="rgba(251,191,36,0.55)",
+            row=2,
+            col=1,
+        )
+
+        # ── Panel 3: Acceptance score vs threshold ───────────────────────────────────
+        # Explains which windows passed the detector gate and by how much.
         if not score_frame.empty:
             fig.add_trace(
                 go.Scatter(
                     x=score_frame.index,
                     y=score_frame["score"],
                     mode="lines+markers",
-                    line=dict(color="#d97706", width=2.2),
-                    marker=dict(size=6, color="#f59e0b", line=dict(color="#78350f", width=0.8)),
+                    line=dict(color="#fbbf24", width=2.0),
+                    marker=dict(size=5, color="#f59e0b", line=dict(color="#78350f", width=0.8)),
                     fill="tozeroy",
-                    fillcolor="rgba(245, 158, 11, 0.14)",
-                    name="Consolidation score",
+                    fillcolor="rgba(245, 158, 11, 0.10)",
+                    name="Acceptance score",
                 ),
-                row=2,
+                row=3,
                 col=1,
             )
             fig.add_hline(
                 y=self.params.consolidation_threshold,
                 line_dash="dash",
-                line_color="#dc2626",
-                opacity=0.8,
-                row=2,
+                line_color="#f87171",
+                opacity=0.75,
+                annotation_text=f"gate {self.params.consolidation_threshold:.3f}",
+                annotation_font_color="#f87171",
+                annotation_font_size=10,
+                row=3,
                 col=1,
             )
 
-        # Panel 3 separates directional conviction into positive and negative probability bars.
-        up_bar_kwargs: dict[str, Any] = {
-            "x": plot_probs[plot_dirs == 1].index,
-            "y": plot_probs[plot_dirs == 1],
-            "name": "Up probability",
-            "marker_color": "#0f766e",
-            "opacity": 0.78,
-        }
-        if bar_width_ms is not None:
-            up_bar_kwargs["width"] = bar_width_ms
-        if len(up_bar_kwargs["x"]) > 0:
-            fig.add_trace(go.Bar(**up_bar_kwargs), row=3, col=1)
-
-        down_bar_kwargs: dict[str, Any] = {
-            "x": plot_probs[plot_dirs == -1].index,
-            "y": -plot_probs[plot_dirs == -1],
-            "name": "Down probability",
-            "marker_color": "#dc2626",
-            "opacity": 0.78,
-        }
-        if bar_width_ms is not None:
-            down_bar_kwargs["width"] = bar_width_ms
-        if len(down_bar_kwargs["x"]) > 0:
-            fig.add_trace(go.Bar(**down_bar_kwargs), row=3, col=1)
-
-        fig.add_hline(y=0.0, line_color="#475569", line_width=1, row=3, col=1)
-        fig.add_hline(y=0.7, line_dash="dot", line_color="#94a3b8", row=3, col=1)
-        fig.add_hline(y=-0.7, line_dash="dot", line_color="#94a3b8", row=3, col=1)
-
-        # Panel 4 tracks the detector subcomponents that shape the final score.
-        if not score_frame.empty:
-            component_frame = (
-                score_frame
-                if DASHBOARD_MAX_COMPONENT_POINTS is None
-                else score_frame.tail(max(1, int(DASHBOARD_MAX_COMPONENT_POINTS)))
-            )
-            component_specs = (
-                ("attention", "#0f766e", "Attention"),
-                ("periodic", "#2563eb", "Periodic"),
-                ("scale", "#d97706", "Scale"),
-                ("sutte", "#a855f7", "Sutte"),
-                ("interaction", "#9a3412", "Interaction"),
-            )
-            for column, color, label in component_specs:
-                fig.add_trace(
-                    go.Scatter(
-                        x=component_frame.index,
-                        y=component_frame[column],
-                        mode="lines+markers",
-                        line=dict(color=color, width=1.9),
-                        marker=dict(size=4),
-                        name=label,
-                    ),
-                    row=4,
-                    col=1,
-                )
-
-        # Panel 5 combines realized volatility with regime-sensitive features.
+        # ── Panel 4: Volatility and regime context ───────────────────────────────────
+        # Environmental conditions. ATR on primary axis, vol ratio / Hurst / Sutte on
+        # secondary so the scales don't fight each other.
         atr_like = (
             plot_df["hl_range"].rolling(20, min_periods=5).mean()
             if "hl_range" in plot_df.columns
@@ -2895,10 +3581,10 @@ class ConsolidationDashboard:
                 x=plot_df.index,
                 y=atr_like,
                 mode="lines",
-                line=dict(color="#1d4ed8", width=2.2),
-                name="ATR-like range",
+                line=dict(color="#60a5fa", width=2.0),
+                name="ATR-20",
             ),
-            row=5,
+            row=4,
             col=1,
             secondary_y=False,
         )
@@ -2909,10 +3595,10 @@ class ConsolidationDashboard:
                     x=plot_df.index,
                     y=plot_df["vol_ratio_20"],
                     mode="lines",
-                    line=dict(color="#d97706", width=1.8, dash="dash"),
+                    line=dict(color="#fbbf24", width=1.6, dash="dash"),
                     name="Vol ratio 20",
                 ),
-                row=5,
+                row=4,
                 col=1,
                 secondary_y=True,
             )
@@ -2923,10 +3609,10 @@ class ConsolidationDashboard:
                     x=plot_df.index,
                     y=plot_df["hurst_20"],
                     mode="lines",
-                    line=dict(color="#64748b", width=1.4, dash="dot"),
+                    line=dict(color="#94a3b8", width=1.4, dash="dot"),
                     name="Hurst 20",
                 ),
-                row=5,
+                row=4,
                 col=1,
                 secondary_y=True,
             )
@@ -2937,10 +3623,10 @@ class ConsolidationDashboard:
                     x=plot_df.index,
                     y=plot_df["sutte_signal"],
                     mode="lines",
-                    line=dict(color="#a855f7", width=1.5, dash="dot"),
+                    line=dict(color="#c084fc", width=1.4, dash="dot"),
                     name="Sutte signal",
                 ),
-                row=5,
+                row=4,
                 col=1,
                 secondary_y=True,
             )
@@ -2950,14 +3636,44 @@ class ConsolidationDashboard:
             fig.add_vrect(
                 x0=plot_df.index[-regime_window],
                 x1=plot_df.index[-1],
-                fillcolor="#fecaca",
-                opacity=0.22,
+                fillcolor="#f87171",
+                opacity=0.10,
                 layer="below",
                 line_width=0,
-                row=5,
+                row=4,
                 col=1,
             )
 
+        # ── Panel 5: Detector component mix ─────────────────────────────────────────
+        # Deep internals. Rendered last so dominant panels stay at the top.
+        if not score_frame.empty:
+            component_frame = (
+                score_frame
+                if DASHBOARD_MAX_COMPONENT_POINTS is None
+                else score_frame.tail(max(1, int(DASHBOARD_MAX_COMPONENT_POINTS)))
+            )
+            component_specs = (
+                ("attention", "#34d399", "Similarity"),
+                ("periodic", "#60a5fa", "Periodic"),
+                ("scale", "#fbbf24", "Scale"),
+                ("sutte", "#c084fc", "Sutte"),
+                ("interaction", "#fb923c", "Interaction"),
+            )
+            for column, color, label in component_specs:
+                fig.add_trace(
+                    go.Scatter(
+                        x=component_frame.index,
+                        y=component_frame[column],
+                        mode="lines+markers",
+                        line=dict(color=color, width=1.8),
+                        marker=dict(size=4),
+                        name=label,
+                    ),
+                    row=5,
+                    col=1,
+                )
+
+        # ── Layout ───────────────────────────────────────────────────────────────────
         fig.update_layout(
             title=dict(
                 text=(
@@ -2968,75 +3684,79 @@ class ConsolidationDashboard:
                     f"Triggers: {int(self.metrics.get('breakout_signals', 0))} | "
                     f"Simulated Sharpe: {np.float64(self.metrics.get('simulated_sharpe', 0.0)):.2f}</sup>"
                 ),
-                font=dict(size=17, family="Space Grotesk, Arial, sans-serif"),
+                font=dict(size=16, color="#e2e8f0", family="'IBM Plex Mono', monospace"),
             ),
             height=height,
-            template="plotly_white",
+            template=_TEMPLATE,
+            # Keep unified hover only on the price panel; sub-panels use closest
+            # to avoid a 5-row label stack that obscures the chart.
             hovermode="x unified",
             barmode="relative",
-            paper_bgcolor="#f5f1e8",
-            plot_bgcolor="#fffdf7",
-            font=dict(color="#1f2937", family="Space Grotesk, Arial, sans-serif"),
-            margin=dict(l=60, r=60, t=90, b=60),
+            paper_bgcolor=_PAPER_BG,
+            plot_bgcolor=_PLOT_BG,
+            font=dict(color=_TEXT, family="'IBM Plex Mono', 'Courier New', monospace"),
+            margin=dict(l=68, r=68, t=90, b=60),
             legend=dict(
                 orientation="h",
                 yanchor="bottom",
                 y=1.01,
                 xanchor="right",
                 x=1.0,
-                bgcolor="rgba(255, 253, 247, 0.7)",
+                bgcolor="rgba(17, 24, 39, 0.72)",
+                bordercolor="rgba(255,255,255,0.08)",
+                borderwidth=1,
+                font=dict(size=11),
             ),
         )
 
-        fig.update_xaxes(
-            showgrid=True,
-            gridcolor="#e7e5e4",
-            rangeslider=dict(visible=False),
-            row=1,
-            col=1,
-        )
+        # Range selector lives on the price panel where the trader's eye is.
+        _xaxis_common = dict(showgrid=True, gridcolor=_GRID, rangeslider=dict(visible=False))
+        fig.update_xaxes(**_xaxis_common, row=1, col=1)
+        fig.update_xaxes(**_xaxis_common, row=2, col=1)
+        fig.update_xaxes(**_xaxis_common, row=3, col=1)
+        fig.update_xaxes(**_xaxis_common, row=4, col=1)
+        fig.update_xaxes(**_xaxis_common, row=5, col=1)
+
         if range_buttons:
             fig.update_xaxes(
-                rangeselector=dict(buttons=range_buttons),
-                showgrid=True,
-                gridcolor="#e7e5e4",
-                row=5,
-                col=1,
-            )
-        else:
-            fig.update_xaxes(
-                showgrid=True,
-                gridcolor="#e7e5e4",
-                row=5,
+                rangeselector=dict(
+                    buttons=range_buttons,
+                    bgcolor="rgba(255,255,255,0.06)",
+                    activecolor="rgba(251,191,36,0.22)",
+                    font=dict(size=11, color=_TEXT),
+                ),
+                row=1,
                 col=1,
             )
 
-        fig.update_yaxes(title_text="Price", showgrid=True, gridcolor="#e7e5e4", row=1, col=1)
-        fig.update_yaxes(title_text="Score", showgrid=True, gridcolor="#e7e5e4", row=2, col=1)
+        _yaxis_common = dict(showgrid=True, gridcolor=_GRID)
+        fig.update_yaxes(title_text="Price", **_yaxis_common, row=1, col=1)
         fig.update_yaxes(
-            title_text="Probability",
-            showgrid=True,
-            gridcolor="#e7e5e4",
-            range=[-1.0, 1.0],
-            row=3,
+            title_text="Conviction",
+            **_yaxis_common,
+            range=[-1.05, 1.05],
+            zeroline=True,
+            zerolinecolor="rgba(255,255,255,0.18)",
+            zerolinewidth=1,
+            row=2,
             col=1,
         )
-        fig.update_yaxes(title_text="Component", showgrid=True, gridcolor="#e7e5e4", row=4, col=1)
+        fig.update_yaxes(title_text="Score", **_yaxis_common, row=3, col=1)
         fig.update_yaxes(
-            title_text="ATR-like",
-            showgrid=True,
-            gridcolor="#e7e5e4",
-            row=5,
+            title_text="ATR-20",
+            **_yaxis_common,
+            row=4,
             col=1,
             secondary_y=False,
         )
         fig.update_yaxes(
-            title_text="Regime / Sutte",
+            title_text="Ratio / Hurst",
             showgrid=False,
-            row=5,
+            row=4,
             col=1,
             secondary_y=True,
         )
+        fig.update_yaxes(title_text="Component", **_yaxis_common, row=5, col=1)
         return fig
 
     def create_consolidation_heatmap(self, days_back: int | None = DASHBOARD_HEATMAP_DAYS) -> Any:
@@ -3064,9 +3784,10 @@ class ConsolidationDashboard:
             )
             fig.update_layout(
                 title="Accepted-window strength heatmap",
-                template="plotly_white",
-                paper_bgcolor="#f5f1e8",
-                plot_bgcolor="#fffdf7",
+                template="plotly_dark",
+                paper_bgcolor="#111827",
+                plot_bgcolor="#131c2e",
+                font=dict(color="#cbd5e1", family="'IBM Plex Mono', monospace"),
                 height=430,
             )
             return fig
@@ -3089,24 +3810,28 @@ class ConsolidationDashboard:
                 x=[f"{hour:02d}:00" for hour in hours],
                 y=[pd.Timestamp(day).strftime("%Y-%m-%d") for day in dates],
                 colorscale=[
-                    [0.0, "#fff7ed"],
-                    [0.45, "#f59e0b"],
-                    [1.0, "#0f766e"],
+                    [0.0, "#0f172a"],
+                    [0.45, "#b45309"],
+                    [1.0, "#34d399"],
                 ],
                 zmin=0.0,
                 zmax=1.0,
                 hoverongaps=False,
-                colorbar=dict(title="Score"),
+                colorbar=dict(
+                    title=dict(text="Score", font=dict(color="#94a3b8")),
+                    tickfont=dict(color="#cbd5e1"),
+                ),
             )
         )
         fig.update_layout(
             title="Accepted-window strength by hour",
             xaxis_title="Hour of day",
             yaxis_title="Date",
-            template="plotly_white",
-            paper_bgcolor="#f5f1e8",
-            plot_bgcolor="#fffdf7",
-            font=dict(color="#1f2937", family="Space Grotesk, Arial, sans-serif"),
+            yaxis_type="category",
+            template="plotly_dark",
+            paper_bgcolor="#111827",
+            plot_bgcolor="#131c2e",
+            font=dict(color="#cbd5e1", family="'IBM Plex Mono', monospace"),
             margin=dict(l=60, r=40, t=60, b=50),
             height=430,
         )
@@ -3130,9 +3855,10 @@ class ConsolidationDashboard:
             )
             fig.update_layout(
                 title="Latest accepted-window follow-through",
-                template="plotly_white",
-                paper_bgcolor="#f5f1e8",
-                plot_bgcolor="#fffdf7",
+                template="plotly_dark",
+                paper_bgcolor="#111827",
+                plot_bgcolor="#131c2e",
+                font=dict(color="#cbd5e1", family="'IBM Plex Mono', monospace"),
                 height=430,
             )
             return fig
@@ -3145,7 +3871,9 @@ class ConsolidationDashboard:
             future_end = min(len(self.df) - 1, latest_cons.end_idx + max(1, int(lookahead)))
 
         history_window = self.df.iloc[context_start : latest_cons.end_idx + 1]
+        history_window = history_window[history_window["close"] > 0]
         post_window = self.df.iloc[latest_cons.end_idx + 1 : future_end + 1]
+        post_window = post_window[post_window["close"] > 0]
         zone_window = self.df.iloc[latest_cons.start_idx : latest_cons.end_idx + 1]
         zone_high = np.float64(zone_window["high"].max())
         zone_low = np.float64(zone_window["low"].min())
@@ -3156,7 +3884,7 @@ class ConsolidationDashboard:
                 x=history_window.index,
                 y=history_window["close"],
                 mode="lines",
-                line=dict(color="#334155", width=2.2),
+                line=dict(color="#94a3b8", width=1.8),
                 name="Historical close",
             )
         )
@@ -3180,8 +3908,8 @@ class ConsolidationDashboard:
                     x=post_window.index,
                     y=post_window["close"],
                     mode="lines+markers",
-                    line=dict(color="#0f766e", width=2.4),
-                    marker=dict(size=5, color="#0f766e"),
+                    line=dict(color="#34d399", width=2.4),
+                    marker=dict(size=5, color="#34d399"),
                     name="Post-zone path",
                 )
             )
@@ -3248,19 +3976,15 @@ class ConsolidationDashboard:
             title=f"Latest accepted-window follow-through ({latest_cons.duration} bars)",
             xaxis_title="Time",
             yaxis_title="Price",
-            template="plotly_white",
-            paper_bgcolor="#f5f1e8",
-            plot_bgcolor="#fffdf7",
-            font=dict(color="#1f2937", family="Space Grotesk, Arial, sans-serif"),
+            template="plotly_dark",
+            paper_bgcolor="#111827",
+            plot_bgcolor="#131c2e",
+            font=dict(color="#cbd5e1", family="'IBM Plex Mono', monospace"),
             margin=dict(l=60, r=40, t=60, b=50),
             height=430,
             hovermode="x unified",
         )
         return fig
-
-    def _has_meaningful_feature_importance(self) -> bool:
-        """Return whether the optimization study produced usable attribution."""
-        return any(abs(np.float64(score)) > 1e-9 for score in self.feature_importance.values())
 
     def _latest_zone_snapshot(self) -> dict[str, str | float | int]:
         """Return timing and maturity context for the latest accepted window."""
@@ -3302,207 +4026,179 @@ class ConsolidationDashboard:
             "maturity": maturity,
         }
 
+    def _benchmark_verdict_label(self) -> str:
+        """Summarize whether the current model clears the logistic baseline."""
+        if "benchmark_brier_improvement" not in self.metrics:
+            return "Unavailable"
+
+        improvement = np.float64(self.metrics.get("benchmark_brier_improvement", 0.0))
+        if improvement > 0.0:
+            return f"Better by {improvement:.4f} Brier"
+        if improvement < 0.0:
+            return f"Worse by {abs(improvement):.4f} Brier"
+        return "Tied on Brier"
+
     def _build_dashboard_brief(
         self,
-        latest_signal: dict[str, str | float],
+        latest_signal: dict[str, Any],
         latest_zone: dict[str, str | float | int],
     ) -> dict[str, Any]:
-        """Convert raw metrics into decision-first narrative content."""
+        """Build a direct answer to the latest consolidation and breakout question."""
         sharpe = np.float64(self.metrics.get("simulated_sharpe", 0.0))
-        win_rate = np.float64(self.metrics.get("simulated_win_rate", 0.0))
-        regime_ratio = np.float64(self.metrics.get("regime_vol_ratio", 1.0))
-        regime_shift = bool(self.metrics.get("regime_shift_flag", 0.0))
-        mean_probability = np.float64(self.metrics.get("mean_probability", 0.0))
-        prob_low = np.float64(self.metrics.get("probability_ci_p05", 0.0))
-        prob_high = np.float64(self.metrics.get("probability_ci_p95", 0.0))
-        prob_band_width = max(np.float64(prob_high - prob_low), 0.0)
-        signal_bias = np.float64(self.metrics.get("signal_bias", 0.0))
-        accepted_windows = int(self.metrics.get("total_consolidations", 0))
-        triggered_signals = int(self.metrics.get("breakout_signals", 0))
-        high_conviction_signals = int(self.metrics.get("high_prob_signals", 0))
+        latest_visibility = str(latest_signal["visibility"])
         latest_probability = np.float64(latest_signal["probability"])
         latest_label = str(latest_signal["label"])
+        latest_timestamp = str(latest_signal["timestamp"])
+        latest_direction = int(latest_signal["direction"])
+        latest_raw_label = str(latest_signal["latest_raw_label"])
+        latest_raw_probability = np.float64(latest_signal["latest_raw_probability"])
+        latest_raw_timestamp = str(latest_signal["latest_raw_timestamp"])
+        latest_raw_direction = int(latest_signal["latest_raw_direction"])
+        threshold = np.float64(latest_signal["threshold"])
+        active_up_count = int(latest_signal["active_up_count"])
+        active_down_count = int(latest_signal["active_down_count"])
+        raw_up_count = int(latest_signal["raw_up_count"])
+        raw_down_count = int(latest_signal["raw_down_count"])
+
+        has_zone = str(latest_zone["available"]) == "yes"
+        zone_duration = int(latest_zone["duration"])
         post_bars = int(latest_zone["post_bars"])
         latest_zone_score = np.float64(latest_zone["score"])
-        importance_available = self._has_meaningful_feature_importance()
+        latest_zone_window = str(latest_zone["window"])
+        latest_zone_maturity = str(latest_zone["maturity"])
 
-        if latest_label == "Standby":
-            stance_label = "Standby"
+        if latest_direction > 0:
+            confirmed_side = "Up"
+        elif latest_direction < 0:
+            confirmed_side = "Down"
+        else:
+            confirmed_side = "None"
+
+        if latest_raw_direction > 0:
+            raw_side = "Up lean"
+        elif latest_raw_direction < 0:
+            raw_side = "Down lean"
+        else:
+            raw_side = "Undecided"
+
+        if not has_zone:
+            setup_state = "No active setup"
             stance_tone = "neutral"
-            trust_label = "No live trigger"
-            headline = "The detector is tracking structure, but no breakout is currently live."
-        elif sharpe < 0 or post_bars <= 3:
-            stance_label = "Watch, do not chase"
-            stance_tone = "risk"
-            trust_label = "Low trust"
+            trust_label = "No zone"
+            consolidation_answer = "No"
+            breakout_side = "None"
+            confidence_label = "n/a"
+            latest_signal_time = "n/a"
+            headline = "No accepted consolidation is active right now."
+            summary = "The detector does not currently have a live zone to trade from."
+        elif latest_visibility == "active":
+            setup_state = "Breaking up" if latest_direction > 0 else "Breaking down"
+            stance_tone = "support" if latest_direction > 0 else "risk"
+            trust_label = "Confirmed"
+            consolidation_answer = "Yes"
+            breakout_side = confirmed_side
+            confidence_label = f"{latest_probability:.1%}"
+            latest_signal_time = latest_timestamp
             headline = (
-                f"Latest call is {latest_label.lower()} at {latest_probability:.1%}, "
-                "but the evidence is not strong enough to treat it as a clean trigger."
+                f"Yes. The latest accepted consolidation is breaking {confirmed_side.lower()}."
             )
-        elif regime_shift or latest_probability < 0.60 or win_rate < 0.52:
-            stance_label = "Caution"
+            summary = (
+                f"Confirmed {latest_label.lower()} at {latest_probability:.1%} on "
+                f"{latest_timestamp}. Price has moved beyond the latest accepted zone."
+            )
+        elif post_bars == 0:
+            setup_state = "Still consolidating"
             stance_tone = "watch"
-            trust_label = "Mixed trust"
+            trust_label = "Inside zone"
+            consolidation_answer = "Yes"
+            breakout_side = raw_side
+            confidence_label = (
+                f"{latest_raw_probability:.1%} raw" if latest_raw_direction != 0 else "n/a"
+            )
+            latest_signal_time = latest_raw_timestamp if latest_raw_direction != 0 else "n/a"
+            headline = "Yes. Price is still inside the latest accepted consolidation."
+            if latest_raw_direction != 0:
+                summary = (
+                    f"The current raw lean is {latest_raw_label.lower()} at "
+                    f"{latest_raw_probability:.1%}, but it is still below the {threshold:.0%} "
+                    "confirmation threshold."
+                )
+            else:
+                summary = "No directional breakout signal is active yet."
+        elif latest_visibility == "subthreshold":
+            setup_state = "Waiting for confirmation"
+            stance_tone = "watch"
+            trust_label = "Below trigger"
+            consolidation_answer = "Recent"
+            breakout_side = raw_side
+            confidence_label = (
+                f"{latest_raw_probability:.1%} raw" if latest_raw_direction != 0 else "n/a"
+            )
+            latest_signal_time = latest_raw_timestamp if latest_raw_direction != 0 else "n/a"
             headline = (
-                f"Latest call is {latest_label.lower()} at {latest_probability:.1%}, "
-                "with enough uncertainty that confirmation matters more than speed."
+                f"The latest consolidation has ended, but the breakout is not confirmed above "
+                f"{threshold:.0%}."
             )
+            if latest_raw_direction != 0:
+                summary = (
+                    f"The latest raw signal is {latest_raw_label.lower()} at "
+                    f"{latest_raw_probability:.1%} on {latest_raw_timestamp}."
+                )
+            else:
+                summary = "The latest zone has ended without a current directional trigger."
         else:
-            stance_label = "Monitor"
-            stance_tone = "support"
-            trust_label = "Better trust"
-            headline = (
-                f"Latest call is {latest_label.lower()} at {latest_probability:.1%}, "
-                "and current run-level diagnostics are supportive enough to keep it on watch."
-            )
-
-        if latest_label == "Standby":
-            summary = (
-                "There is no active directional trigger above threshold. "
-                "Use the structure view for context rather than for immediate execution."
-            )
-        else:
-            summary = (
-                f"The latest accepted window scored {latest_zone_score:.3f}, spans "
-                f"{int(latest_zone['duration'])} bars, and currently has {post_bars} post-zone bars. "
-                f"Simulated Sharpe is {sharpe:.2f}, win rate is {win_rate:.1%}, and the regime ratio is {regime_ratio:.2f}."
-            )
-
-        regret_points: list[str] = []
-        if sharpe < 0:
-            regret_points.append(
-                f"Recent simulated follow-through is negative on a risk-adjusted basis (Sharpe {sharpe:.2f})."
-            )
-        if latest_label != "Standby" and post_bars <= 3:
-            regret_points.append(
-                f"The latest accepted window only has {post_bars} post-zone bars, so the breakout is still immature."
-            )
-        if regime_shift:
-            regret_points.append(
-                f"Volatility has shifted to {regime_ratio:.2f}x baseline, so historical behavior may transfer poorly."
-            )
-        if prob_band_width >= 0.12:
-            regret_points.append(
-                f"The run-level probability band is still wide ({prob_low:.1%} to {prob_high:.1%})."
-            )
-        if not importance_available:
-            regret_points.append(
-                "Optimization importance is flat or unavailable, so attribution is not explaining this run."
-            )
-        if not regret_points:
-            regret_points.append(
-                "No single contradiction dominates this run, but confirmation still matters more than the headline signal."
-            )
-
-        if signal_bias > 0.20:
-            bias_text = f"tilting upside ({signal_bias:.2f})"
-        elif signal_bias < -0.20:
-            bias_text = f"tilting downside ({signal_bias:.2f})"
-        else:
-            bias_text = f"near-balanced ({signal_bias:.2f})"
-
-        regime_text = "stable volatility backdrop" if not regime_shift else "shifted volatility backdrop"
-        story_text = (
-            f"The run accepted {accepted_windows} windows and triggered {triggered_signals} breakouts in a "
-            f"{regime_text}. The flow is {bias_text}, with {high_conviction_signals} signals above 70% probability. "
-            "That reads as repeated compression, not a one-off shock event."
-        )
-
-        if latest_label == "Standby":
-            counter_text = (
-                "The disciplined move is patience. Without a live trigger, adding interpretation usually adds noise."
-            )
-        elif sharpe < 0 or post_bars <= 3:
-            counter_text = (
-                "The disciplined move is to downgrade the latest signal from trade trigger to watchlist item. "
-                "Waiting for more follow-through bars is safer than reacting to a single probability print."
-            )
-        elif accepted_windows > max(20, triggered_signals * 3):
-            counter_text = (
-                "Be more selective, not more aggressive. A busy dashboard often means the detector is permissive."
-            )
-        else:
-            counter_text = (
-                "Respect the regime more than the headline probability. If volatility changes first, thresholds lag."
-            )
-
-        if accepted_windows > max(20, triggered_signals * 2):
-            devil_text = (
-                "Assume the detector is slightly too permissive. Overlapping accepted windows can make one structural "
-                "episode look like many separate opportunities."
-            )
-        elif abs(signal_bias) > 0.50:
-            devil_text = (
-                "Assume the directional bias is model preference rather than market truth. Strong bias can reverse fast."
-            )
-        else:
-            devil_text = (
-                "Assume the latest clean-looking setup is ordinary noise. If price cannot hold outside the range soon, "
-                "the model caught compression without expansion."
-            )
-
-        other_text = (
-            f"Accepted-window count ({accepted_windows}) is structural coverage, not a count of unique market episodes. "
-            f"The run-level probability band ({prob_low:.1%} to {prob_high:.1%}) describes the average active signal, "
-            "not a confidence interval for the latest point."
-        )
-        if not importance_available:
-            other_text += " The optimization panel stays in an empty state when attribution collapses to zero."
-
-        story_cards = [
-            {
-                "kicker": "Story",
-                "title": "What the data is telling",
-                "copy": story_text,
-            },
-            {
-                "kicker": "Counterintuitive move",
-                "title": "What to do differently",
-                "copy": counter_text,
-            },
-            {
-                "kicker": "Devil's advocate",
-                "title": "The strongest case against the signal",
-                "copy": devil_text,
-            },
-            {
-                "kicker": "What else to know",
-                "title": "The semantic trap to avoid",
-                "copy": other_text,
-            },
-        ]
+            setup_state = "Recent zone, no trigger"
+            stance_tone = "neutral"
+            trust_label = "No trigger"
+            consolidation_answer = "Recent"
+            breakout_side = "None"
+            confidence_label = "n/a"
+            latest_signal_time = "n/a"
+            headline = "A recent consolidation exists, but there is no current breakout signal."
+            summary = "The model has no active directional read from the latest accepted zone."
 
         summary_rows = [
-            ("Live call", latest_label),
-            (
-                "Latest confidence",
-                "n/a" if latest_label == "Standby" else f"{latest_probability:.1%}",
-            ),
+            ("Is this a consolidation?", consolidation_answer),
+            ("Setup state", setup_state),
+            ("Breakout side", breakout_side),
+            ("Confidence", confidence_label),
+            ("Latest signal time", latest_signal_time),
+            ("Zone score", "n/a" if not has_zone else f"{latest_zone_score:.3f}"),
+            ("Zone duration", "n/a" if not has_zone else f"{zone_duration} bars"),
+            ("Post-zone bars", "n/a" if not has_zone else str(post_bars)),
+            ("Active up / down", f"{active_up_count} / {active_down_count}"),
+            ("Raw up / down", f"{raw_up_count} / {raw_down_count}"),
+            ("Display threshold", f"{threshold:.0%}"),
             ("Simulated Sharpe", f"{sharpe:.2f}"),
-            ("Win rate", f"{win_rate:.1%}"),
-            ("Regime ratio", f"{regime_ratio:.2f}"),
-            (
-                "Post-zone bars",
-                "n/a" if str(latest_zone["available"]) != "yes" else str(post_bars),
-            ),
         ]
+        benchmark_verdict = self._benchmark_verdict_label()
+        if benchmark_verdict != "Unavailable":
+            summary_rows.append(("Benchmark vs baseline", benchmark_verdict))
 
         return {
-            "stance_label": stance_label,
+            "setup_state": setup_state,
             "stance_tone": stance_tone,
             "trust_label": trust_label,
             "headline": headline,
             "summary": summary,
-            "regret_points": regret_points[:4],
-            "story_cards": story_cards,
             "summary_rows": summary_rows,
-            "latest_zone_window": str(latest_zone["window"]),
-            "latest_zone_maturity": str(latest_zone["maturity"]),
-            "run_mean_probability": f"{mean_probability:.1%}",
+            "consolidation_answer": consolidation_answer,
+            "breakout_side": breakout_side,
+            "confidence_label": confidence_label,
+            "latest_signal_time": latest_signal_time,
+            "zone_score": "n/a" if not has_zone else f"{latest_zone_score:.3f}",
+            "zone_duration": "n/a" if not has_zone else f"{zone_duration} bars",
+            "post_zone_bars": "n/a" if not has_zone else str(post_bars),
+            "active_breakout_mix": f"{active_up_count} / {active_down_count}",
+            "raw_breakout_mix": f"{raw_up_count} / {raw_down_count}",
+            "display_threshold": f"{threshold:.0%}",
+            "benchmark_verdict": benchmark_verdict,
+            "latest_zone_window": latest_zone_window,
+            "latest_zone_maturity": latest_zone_maturity,
         }
 
     def _render_executive_panel(self, brief: dict[str, Any]) -> str:
-        """Render the primary decision summary for the current run."""
+        """Render the direct-answer panel for the current run."""
         rendered_rows = []
         for label, value in brief["summary_rows"]:
             rendered_rows.append(
@@ -3515,25 +4211,25 @@ class ConsolidationDashboard:
             )
 
         return f"""
-        <article class="summary-card summary-card-primary tone-{brief['stance_tone']}">
+        <article class="summary-card summary-card-primary tone-{brief["stance_tone"]}">
             <div class="summary-header">
                 <div>
-                    <div class="panel-kicker">What matters now</div>
-                    <h2 class="summary-title">{html.escape(str(brief['stance_label']))}</h2>
+                    <div class="panel-kicker">Direct Answer</div>
+                    <h2 class="summary-title">Is this a consolidation, and which way is it breaking?</h2>
                 </div>
-                <div class="status-chip status-{brief['stance_tone']}">
-                    {html.escape(str(brief['trust_label']))}
+                <div class="status-chip status-{brief["stance_tone"]}">
+                    {html.escape(str(brief["trust_label"]))}
                 </div>
             </div>
-            <p class="summary-copy">{html.escape(str(brief['headline']))}</p>
-            <p class="summary-copy summary-copy-muted">{html.escape(str(brief['summary']))}</p>
+            <p class="summary-copy">{html.escape(str(brief["headline"]))}</p>
+            <p class="summary-copy summary-copy-muted">{html.escape(str(brief["summary"]))}</p>
             <dl class="summary-metrics">
-                {''.join(rendered_rows)}
+                {"".join(rendered_rows)}
             </dl>
             <div class="summary-footer">
-                <span>Latest window: {html.escape(str(brief['latest_zone_window']))}</span>
-                <span>Maturity: {html.escape(str(brief['latest_zone_maturity']))}</span>
-                <span>Run mean probability: {html.escape(str(brief['run_mean_probability']))}</span>
+                <span>Latest window: {html.escape(str(brief["latest_zone_window"]))}</span>
+                <span>Maturity: {html.escape(str(brief["latest_zone_maturity"]))}</span>
+                <span>Display threshold: {html.escape(str(brief["display_threshold"]))}</span>
             </div>
         </article>
         """
@@ -3545,54 +4241,75 @@ class ConsolidationDashboard:
             rendered_points.append(f"<li>{html.escape(str(point))}</li>")
 
         return f"""
-        <article class="summary-card summary-card-secondary tone-{brief['stance_tone']}">
+        <article class="summary-card summary-card-secondary tone-{brief["stance_tone"]}">
             <div class="panel-kicker">What you'd regret not knowing</div>
             <h2 class="summary-title">The contradiction summary</h2>
             <ul class="summary-list">
-                {''.join(rendered_points)}
+                {"".join(rendered_points)}
             </ul>
         </article>
         """
 
-    def _render_story_cards(self, brief: dict[str, Any]) -> str:
-        """Render the narrative question cards that frame the dashboard."""
-        rendered_cards = []
-        for card in brief["story_cards"]:
-            rendered_cards.append(
-                f"""
-                <article class="question-card">
-                    <div class="panel-kicker">{html.escape(str(card['kicker']))}</div>
-                    <h3 class="question-title">{html.escape(str(card['title']))}</h3>
-                    <p class="question-copy">{html.escape(str(card['copy']))}</p>
-                </article>
-                """
-            )
-        return "".join(rendered_cards)
+    def _render_direction_panel(self, brief: dict[str, Any]) -> str:
+        """Render the top-line setup answer in the hero panel."""
+        return f"""
+        <aside class="hero-status tone-{html.escape(str(brief["stance_tone"]))}">
+            <div class="hero-status-label">Current setup</div>
+            <div class="hero-status-value">{html.escape(str(brief["setup_state"]))}</div>
+            <p class="hero-status-copy">{html.escape(str(brief["headline"]))}</p>
+            <div class="hero-status-grid">
+                <div class="hero-status-metric">
+                    <span>Consolidation</span>
+                    <strong>{html.escape(str(brief["consolidation_answer"]))}</strong>
+                </div>
+                <div class="hero-status-metric">
+                    <span>Breakout side</span>
+                    <strong>{html.escape(str(brief["breakout_side"]))}</strong>
+                </div>
+                <div class="hero-status-metric">
+                    <span>Confidence</span>
+                    <strong>{html.escape(str(brief["confidence_label"]))}</strong>
+                </div>
+                <div class="hero-status-metric">
+                    <span>Latest signal time</span>
+                    <strong>{html.escape(str(brief["latest_signal_time"]))}</strong>
+                </div>
+            </div>
+        </aside>
+        """
 
-    def _render_snapshot_cards(self) -> str:
-        """Render compact supporting metrics with clearer labels."""
-        prob_low = np.float64(self.metrics.get("probability_ci_p05", 0.0))
-        prob_high = np.float64(self.metrics.get("probability_ci_p95", 0.0))
+    def _render_snapshot_cards(self, brief: dict[str, Any]) -> str:
+        """Render compact cards that support the top-line answer."""
         cards = [
             (
-                "Accepted windows",
-                f"{int(self.metrics.get('total_consolidations', 0))}",
-                "Overlapping windows accepted by the detector",
+                "Breakout side",
+                str(brief["breakout_side"]),
+                "Confirmed side or best raw lean from the latest setup",
             ),
             (
-                "Triggered breakouts",
-                f"{int(self.metrics.get('breakout_signals', 0))}",
-                "Bars with non-zero directional output",
+                "Confidence",
+                str(brief["confidence_label"]),
+                "Confirmed probability or raw lean strength",
             ),
             (
-                "High-conviction signals",
-                f"{int(self.metrics.get('high_prob_signals', 0))}",
-                "Signals above 70% probability",
+                "Zone score",
+                str(brief["zone_score"]),
+                "Latest accepted consolidation score",
             ),
             (
-                "Run mean probability",
-                f"{np.float64(self.metrics.get('mean_probability', 0.0)):.1%}",
-                f"Bootstrap mean band {prob_low:.1%} to {prob_high:.1%}",
+                "Post-zone bars",
+                str(brief["post_zone_bars"]),
+                "0 means price is still inside the latest zone",
+            ),
+            (
+                "Active up / down",
+                str(brief["active_breakout_mix"]),
+                f"Signals above the {brief['display_threshold']} display threshold",
+            ),
+            (
+                "Raw up / down",
+                str(brief["raw_breakout_mix"]),
+                "All non-zero model directions in the loaded window",
             ),
         ]
 
@@ -3613,7 +4330,7 @@ class ConsolidationDashboard:
         """Render component averages alongside learned parameter weights."""
         component_rows = [
             (
-                "Attention context",
+                "Similarity context",
                 np.float64(self.metrics.get("mean_attention_context_score", 0.0)),
                 np.float64(self.params.weight_attention),
                 "Similarity to prior compression windows",
@@ -3680,40 +4397,62 @@ class ConsolidationDashboard:
             """
         )
 
-    def _render_feature_importance_table(self) -> str:
-        """Render optimization parameter influence for quick diagnostics."""
-        rows = [
-            row for row in self._top_feature_importance_rows() if abs(np.float64(row[1])) > 1e-9
-        ]
-        if not rows:
+    def _render_benchmark_table(self) -> str:
+        """Render the simple baseline comparison used to falsify the complex model."""
+        if "benchmark_model_brier" not in self.metrics:
             return """
             <div class="empty-state">
-                Optimization importance is flat or unavailable for this run.
-                Do not infer that every parameter matters equally; this study did not
-                expose stable attribution.
+                Baseline benchmarking is unavailable for this run.
             </div>
             """
 
+        rows = [
+            (
+                "Current detector",
+                np.float64(self.metrics.get("benchmark_model_brier", 0.0)),
+                np.float64(self.metrics.get("benchmark_model_answered_accuracy", 0.0)),
+                np.float64(self.metrics.get("benchmark_model_coverage", 0.0)),
+                "Consolidation detector plus breakout scorer",
+            ),
+            (
+                "Logistic baseline",
+                np.float64(self.metrics.get("benchmark_baseline_brier", 0.0)),
+                np.float64(self.metrics.get("benchmark_baseline_answered_accuracy", 0.0)),
+                np.float64(self.metrics.get("benchmark_baseline_coverage", 0.0)),
+                "Regularized logistic regression on compact price features",
+            ),
+        ]
+
         rendered_rows = []
-        for key, importance, current_value in rows:
+        for label, brier_score, answered_accuracy, coverage, description in rows:
             rendered_rows.append(
                 f"""
                 <tr>
-                    <td>{html.escape(key)}</td>
-                    <td>{importance:.3f}</td>
-                    <td>{current_value:.3f}</td>
+                    <td>{html.escape(label)}</td>
+                    <td>{brier_score:.4f}</td>
+                    <td>{answered_accuracy:.1%}</td>
+                    <td>{coverage:.1%}</td>
+                    <td>{description}</td>
                 </tr>
                 """
             )
 
+        verdict = html.escape(self._benchmark_verdict_label())
+        sample_count = int(np.float64(self.metrics.get("benchmark_sample_count", 0.0)))
         return (
-            """
+            f"""
+            <div class="table-note">
+                Lower Brier is better. Answered accuracy is measured only on bars where the model
+                emitted a direction. Sample count: {sample_count}. Verdict: {verdict}.
+            </div>
             <table class="data-table">
                 <thead>
                     <tr>
-                        <th>Parameter</th>
-                        <th>Importance</th>
-                        <th>Current Value</th>
+                        <th>Model</th>
+                        <th>Brier</th>
+                        <th>Answered Accuracy</th>
+                        <th>Coverage</th>
+                        <th>Intent</th>
                     </tr>
                 </thead>
                 <tbody>
@@ -3747,12 +4486,16 @@ class ConsolidationDashboard:
         latest_signal = self._latest_signal_summary()
         latest_zone = self._latest_zone_snapshot()
         dashboard_brief = self._build_dashboard_brief(latest_signal, latest_zone)
+        direction_panel_html = self._render_direction_panel(dashboard_brief)
         executive_panel_html = self._render_executive_panel(dashboard_brief)
-        caution_panel_html = self._render_caution_panel(dashboard_brief)
-        story_cards_html = self._render_story_cards(dashboard_brief)
-        snapshot_cards_html = self._render_snapshot_cards()
+        snapshot_cards_html = self._render_snapshot_cards(dashboard_brief)
         component_table_html = self._render_component_table()
-        feature_importance_html = self._render_feature_importance_table()
+        benchmark_table_html = self._render_benchmark_table()
+        caution_panel_html = (
+            self._render_caution_panel(dashboard_brief)
+            if "regret_points" in dashboard_brief
+            else ""
+        )
 
         if output_path is None:
             output_path = Path(DASHBOARD_OUTPUT_DIR) / DASHBOARD_OUTPUT_NAME
@@ -3796,25 +4539,22 @@ class ConsolidationDashboard:
     <meta charset="utf-8">
     <meta name="viewport" content="width=device-width, initial-scale=1">
     <title>Consolidation Detection Dashboard</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Space+Grotesk:wght@400;500;600;700&display=swap" rel="stylesheet">
     <script src="https://cdn.plot.ly/plotly-latest.min.js"></script>
     <style>
         :root {{
-            --bg-top: #f4efe4;
-            --bg-bottom: #edf4ef;
-            --panel: rgba(255, 252, 247, 0.88);
-            --panel-strong: rgba(255, 255, 255, 0.96);
-            --border: rgba(148, 163, 184, 0.22);
-            --shadow: 0 24px 60px rgba(15, 23, 42, 0.10);
-            --text: #1f2937;
-            --muted: #64748b;
-            --teal: #0f766e;
-            --amber: #d97706;
-            --red: #dc2626;
-            --blue: #2563eb;
-            --slate: #334155;
+            --bg-top: #0a0f1e;
+            --bg-bottom: #0f172a;
+            --panel: rgba(17, 24, 39, 0.88);
+            --panel-strong: rgba(30, 41, 59, 0.96);
+            --border: rgba(148, 163, 184, 0.12);
+            --shadow: 0 24px 60px rgba(0, 0, 0, 0.45);
+            --text: #e2e8f0;
+            --muted: #94a3b8;
+            --teal: #34d399;
+            --amber: #fbbf24;
+            --red: #f87171;
+            --blue: #60a5fa;
+            --slate: #94a3b8;
             --radius: 26px;
         }}
 
@@ -3827,10 +4567,10 @@ class ConsolidationDashboard:
             min-height: 100vh;
             color: var(--text);
             background:
-                radial-gradient(circle at top left, rgba(245, 158, 11, 0.14), transparent 34%),
-                radial-gradient(circle at top right, rgba(15, 118, 110, 0.12), transparent 30%),
+                radial-gradient(circle at top left, rgba(52, 211, 153, 0.06), transparent 34%),
+                radial-gradient(circle at top right, rgba(96, 165, 250, 0.05), transparent 30%),
                 linear-gradient(180deg, var(--bg-top), var(--bg-bottom));
-            font-family: "Space Grotesk", "Segoe UI", sans-serif;
+            font-family: "IBM Plex Mono", "Courier New", monospace;
         }}
 
         .page {{
@@ -3845,7 +4585,7 @@ class ConsolidationDashboard:
             border-radius: 32px;
             border: 1px solid var(--border);
             background:
-                linear-gradient(140deg, rgba(255, 250, 244, 0.96), rgba(244, 252, 248, 0.90));
+                linear-gradient(140deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.90));
             box-shadow: var(--shadow);
         }}
 
@@ -3856,7 +4596,7 @@ class ConsolidationDashboard:
             width: 260px;
             height: 260px;
             border-radius: 999px;
-            background: radial-gradient(circle, rgba(15, 118, 110, 0.16), transparent 70%);
+            background: radial-gradient(circle, rgba(52, 211, 153, 0.08), transparent 70%);
             pointer-events: none;
         }}
 
@@ -3907,7 +4647,7 @@ class ConsolidationDashboard:
 
         .hero-status {{
             padding: 22px;
-            background: rgba(255, 255, 255, 0.72);
+            background: rgba(30, 41, 59, 0.72);
         }}
 
         .hero-status-label {{
@@ -3930,6 +4670,36 @@ class ConsolidationDashboard:
             line-height: 1.6;
         }}
 
+        .hero-status-grid {{
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: 12px;
+            margin-top: 18px;
+        }}
+
+        .hero-status-metric {{
+            padding: 12px 14px;
+            border-radius: 18px;
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            background: rgba(30, 41, 59, 0.64);
+        }}
+
+        .hero-status-metric span {{
+            display: block;
+            color: var(--muted);
+            font-size: 0.76rem;
+            text-transform: uppercase;
+            letter-spacing: 0.08em;
+        }}
+
+        .hero-status-metric strong {{
+            display: block;
+            margin-top: 8px;
+            font-family: "IBM Plex Mono", monospace;
+            font-size: 0.98rem;
+            font-weight: 600;
+        }}
+
         .pill-row {{
             display: flex;
             flex-wrap: wrap;
@@ -3940,8 +4710,8 @@ class ConsolidationDashboard:
         .pill {{
             padding: 10px 14px;
             border-radius: 999px;
-            border: 1px solid rgba(15, 23, 42, 0.08);
-            background: rgba(255, 255, 255, 0.68);
+            border: 1px solid rgba(148, 163, 184, 0.16);
+            background: rgba(30, 41, 59, 0.68);
             color: var(--text);
             font-size: 0.92rem;
         }}
@@ -3957,7 +4727,7 @@ class ConsolidationDashboard:
         }}
 
         .summary-grid {{
-            grid-template-columns: 1.35fr 1fr;
+            grid-template-columns: 1fr;
         }}
 
         .question-grid {{
@@ -3965,7 +4735,7 @@ class ConsolidationDashboard:
         }}
 
         .snapshot-grid {{
-            grid-template-columns: repeat(4, minmax(0, 1fr));
+            grid-template-columns: repeat(3, minmax(0, 1fr));
         }}
 
         .panel-grid {{
@@ -3977,19 +4747,19 @@ class ConsolidationDashboard:
         }}
 
         .tone-risk {{
-            border-color: rgba(220, 38, 38, 0.22);
+            border-color: rgba(248, 113, 113, 0.28);
         }}
 
         .tone-watch {{
-            border-color: rgba(217, 119, 6, 0.24);
+            border-color: rgba(251, 191, 36, 0.28);
         }}
 
         .tone-support {{
-            border-color: rgba(15, 118, 110, 0.28);
+            border-color: rgba(52, 211, 153, 0.28);
         }}
 
         .tone-neutral {{
-            border-color: rgba(148, 163, 184, 0.22);
+            border-color: rgba(148, 163, 184, 0.18);
         }}
 
         .summary-card {{
@@ -3997,11 +4767,11 @@ class ConsolidationDashboard:
         }}
 
         .summary-card-primary {{
-            background: linear-gradient(160deg, rgba(255, 255, 255, 0.96), rgba(247, 251, 248, 0.88));
+            background: linear-gradient(160deg, rgba(17, 24, 39, 0.96), rgba(15, 23, 42, 0.88));
         }}
 
         .summary-card-secondary {{
-            background: linear-gradient(160deg, rgba(255, 248, 244, 0.96), rgba(255, 255, 255, 0.86));
+            background: linear-gradient(160deg, rgba(20, 28, 46, 0.96), rgba(17, 24, 39, 0.86));
         }}
 
         .summary-header {{
@@ -4028,27 +4798,27 @@ class ConsolidationDashboard:
         }}
 
         .status-risk {{
-            color: var(--red);
-            background: rgba(220, 38, 38, 0.08);
-            border-color: rgba(220, 38, 38, 0.16);
+            color: #f87171;
+            background: rgba(248, 113, 113, 0.10);
+            border-color: rgba(248, 113, 113, 0.22);
         }}
 
         .status-watch {{
-            color: var(--amber);
-            background: rgba(217, 119, 6, 0.10);
-            border-color: rgba(217, 119, 6, 0.20);
+            color: #fbbf24;
+            background: rgba(251, 191, 36, 0.10);
+            border-color: rgba(251, 191, 36, 0.22);
         }}
 
         .status-support {{
-            color: var(--teal);
-            background: rgba(15, 118, 110, 0.10);
-            border-color: rgba(15, 118, 110, 0.18);
+            color: #34d399;
+            background: rgba(52, 211, 153, 0.10);
+            border-color: rgba(52, 211, 153, 0.20);
         }}
 
         .status-neutral {{
             color: var(--slate);
-            background: rgba(51, 65, 85, 0.08);
-            border-color: rgba(51, 65, 85, 0.16);
+            background: rgba(148, 163, 184, 0.08);
+            border-color: rgba(148, 163, 184, 0.18);
         }}
 
         .summary-copy {{
@@ -4072,8 +4842,8 @@ class ConsolidationDashboard:
             margin: 0;
             padding: 14px 16px;
             border-radius: 18px;
-            border: 1px solid rgba(148, 163, 184, 0.16);
-            background: rgba(255, 255, 255, 0.64);
+            border: 1px solid rgba(148, 163, 184, 0.12);
+            background: rgba(30, 41, 59, 0.64);
         }}
 
         .summary-metric dt {{
@@ -4196,7 +4966,7 @@ class ConsolidationDashboard:
         }}
 
         .details-shell[open] {{
-            background: rgba(255, 252, 247, 0.92);
+            background: rgba(17, 24, 39, 0.92);
         }}
 
         .details-summary {{
@@ -4249,6 +5019,13 @@ class ConsolidationDashboard:
             color: var(--muted);
             font-size: 0.98rem;
             line-height: 1.6;
+        }}
+
+        .table-note {{
+            margin-bottom: 14px;
+            color: var(--muted);
+            font-size: 0.94rem;
+            line-height: 1.55;
         }}
 
         @keyframes rise {{
@@ -4307,6 +5084,10 @@ class ConsolidationDashboard:
                 grid-template-columns: 1fr;
             }}
 
+            .hero-status-grid {{
+                grid-template-columns: 1fr;
+            }}
+
             .panel-head,
             .details-summary,
             .summary-header {{
@@ -4326,35 +5107,28 @@ class ConsolidationDashboard:
             <div class="hero-grid">
                 <div>
                     <div class="eyebrow">Consolidation detection dashboard</div>
-                    <h1 class="hero-title">Trade-readiness, regime context, and model trust</h1>
+                    <h1 class="hero-title">Is it consolidating, and which way is it breaking?</h1>
                     <p class="hero-copy">
-                        This layout leads with the live call, the reasons to doubt it,
-                        and the evidence trail underneath so an end user can move quickly
-                        without missing the caveats.
+                        The dashboard answers the setup question first: is there a current
+                        consolidation, what is the breakout side, and how strong is that call.
+                        The charts and appendix underneath are supporting evidence, not the main point.
                     </p>
                     <div class="pill-row">
                         <div class="pill">Window: {title_start} to {title_end}</div>
                         <div class="pill">Plot span: {html.escape(plot_window_label)}</div>
                         <div class="pill">Parameter hash: {self.params.get_hash()}</div>
-                        <div class="pill">Threshold: {self.params.consolidation_threshold:.3f}</div>
+                        <div class="pill">Consolidation threshold: {self.params.consolidation_threshold:.3f}</div>
+                        <div class="pill">Signal display threshold: {np.float64(latest_signal["threshold"]):.0%}</div>
                         <div class="pill">Generated: {generated_at}</div>
                     </div>
                 </div>
-                <aside class="hero-status tone-{dashboard_brief['stance_tone']}">
-                    <div class="hero-status-label">Current stance</div>
-                    <div class="hero-status-value">{html.escape(str(dashboard_brief['stance_label']))}</div>
-                    <p class="hero-status-copy">{html.escape(str(dashboard_brief['headline']))}</p>
-                </aside>
+                {direction_panel_html}
             </div>
         </section>
 
         <section class="summary-grid">
             {executive_panel_html}
             {caution_panel_html}
-        </section>
-
-        <section class="question-grid">
-            {story_cards_html}
         </section>
 
         <section class="snapshot-grid">
@@ -4419,12 +5193,12 @@ class ConsolidationDashboard:
                 <article class="panel">
                     <div class="panel-head">
                         <div>
-                            <div class="panel-kicker">Optimization</div>
-                            <h2 class="panel-title">What the study could explain</h2>
+                            <div class="panel-kicker">Baseline Check</div>
+                            <h2 class="panel-title">Does the complex model beat a simple one?</h2>
                         </div>
-                        <div class="panel-meta">Top-ranked drivers when attribution is meaningful</div>
+                        <div class="panel-meta">Same rolling splits, same horizon, lower Brier wins</div>
                     </div>
-                    {feature_importance_html}
+                    {benchmark_table_html}
                 </article>
             </div>
         </details>
@@ -4445,7 +5219,7 @@ class ConsolidationDashboard:
 
 def main() -> None:
     """Main execution function."""
-    logger.info("Starting Consolidation Detection Framework pipeline")
+    logger.info("Starting autonomous consolidation detection system")
     setup_random_seed()
 
     loader = DataLoader()
@@ -4496,6 +5270,9 @@ def main() -> None:
 
     analyzer = PerformanceAnalyzer()
     metrics = analyzer.calculate_metrics(df, consolidations, probabilities, directions)
+    if BASELINE_BENCHMARK_ENABLED:
+        benchmark = BaselineBenchmark(best_params, n_splits=VALIDATION_SPLITS)
+        metrics.update(benchmark.evaluate(df))
 
     feature_importance = optimizer.get_feature_importance()
 
@@ -4505,7 +5282,7 @@ def main() -> None:
     logger.info(f"Simulated Sharpe: {metrics['simulated_sharpe']:.4f}")
     logger.info("Mean consolidation score: %.4f", metrics["mean_consolidation_score"])
     logger.info(
-        "Mean context scores (attention/periodic/scale/sutte): %.4f / %.4f / %.4f / %.4f",
+        "Mean context scores (similarity/periodic/scale/sutte): %.4f / %.4f / %.4f / %.4f",
         metrics["mean_attention_context_score"],
         metrics["mean_periodic_context_score"],
         metrics["mean_scale_anchor_score"],
@@ -4517,8 +5294,48 @@ def main() -> None:
         metrics["probability_ci_p50"],
         metrics["probability_ci_p95"],
     )
+    logger.info(
+        "Signal distribution (up/down/neutral): %d / %d / %d",
+        int(metrics["up_breakout_signals"]),
+        int(metrics["down_breakout_signals"]),
+        int(metrics["neutral_signal_bars"]),
+    )
+    visible_up_signals = int(
+        ((directions == 1) & (probabilities >= DASHBOARD_SIGNAL_PROBABILITY_THRESHOLD)).sum()
+    )
+    visible_down_signals = int(
+        ((directions == -1) & (probabilities >= DASHBOARD_SIGNAL_PROBABILITY_THRESHOLD)).sum()
+    )
+    logger.info(
+        "Dashboard-visible signals at %.2f probability (up/down): %d / %d",
+        DASHBOARD_SIGNAL_PROBABILITY_THRESHOLD,
+        visible_up_signals,
+        visible_down_signals,
+    )
     logger.info("Regime volatility ratio: %.4f", metrics["regime_vol_ratio"])
     logger.info("Regime EW volatility ratio: %.4f", metrics["regime_ewm_vol_ratio"])
+    if "benchmark_model_brier" in metrics:
+        logger.info(
+            "Benchmark Brier (model/logistic): %.4f / %.4f",
+            metrics["benchmark_model_brier"],
+            metrics["benchmark_baseline_brier"],
+        )
+        logger.info(
+            "Benchmark answered accuracy (model/logistic): %.1f%% / %.1f%%",
+            100.0 * metrics["benchmark_model_answered_accuracy"],
+            100.0 * metrics["benchmark_baseline_answered_accuracy"],
+        )
+        logger.info(
+            "Benchmark coverage (model/logistic): %.1f%% / %.1f%%",
+            100.0 * metrics["benchmark_model_coverage"],
+            100.0 * metrics["benchmark_baseline_coverage"],
+        )
+        logger.info(
+            "Benchmark verdict: %s",
+            "model beats logistic baseline"
+            if metrics["benchmark_model_beats_baseline"] > 0
+            else "logistic baseline matches or beats model",
+        )
     logger.info("Optimized parameter hash: %s", best_params.get_hash())
     logger.info("Final consolidation threshold: %.4f", best_params.consolidation_threshold)
     logger.debug("Feature importance summary: %s", feature_importance)
