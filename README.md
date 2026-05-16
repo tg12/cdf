@@ -361,3 +361,13 @@ GitHub-compatible citation metadata is available in [`CITATION.cff`](CITATION.cf
 4. Hyndman, R. J., and Athanasopoulos, G. *Forecasting: Principles and Practice*, 3rd ed., Section 5.10, Time Series Cross-Validation. OTexts. https://otexts.com/fpp3/tscv.html
 5. Lai, G., Chang, W. C., Yang, Y., and Liu, H. *Modeling Long- and Short-Term Temporal Patterns with Deep Neural Networks*. arXiv:1703.07015, 2018. https://doi.org/10.48550/arXiv.1703.07015
 6. Wilder, J. W. *New Concepts in Technical Trading Systems*. Trend Research, 1978. https://books.google.com/books/about/New_Concepts_in_Technical_Trading_System.html?id=WesJAQAAMAAJ
+
+## Support
+
+If you find this project useful, consider supporting it:
+
+| Currency | Address |
+|----------|---------|
+| **Bitcoin (BTC)** | `3QjWqhQbHdHgWeYHTpmorP8Pe1wgDjJy54` |
+| **Ethereum (ETH)** | `0x5851e6145F4773d1585b8686095FB16E368a4dA1` |
+| **ZCash (ZEC)** | `t1KSR5YkNPbjqRSCoLKo5AddFWdm9Kzxh1B` |
